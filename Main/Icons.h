@@ -1769,6 +1769,10 @@ const uint16_t iconKeyTest[] PROGMEM = {
 
 };
 
+const uint16_t iconPackMon[] PROGMEM = {
+
+};
+
 // ---------------------------- STATUS BAR ICONS -----------------------------
 const uint16_t iconBatteryStatus[] PROGMEM = {
 
