@@ -26,7 +26,8 @@ enum UIState
     BLECMD,     // "BLECMD" app: BLE HID keyboard
     BREAKOUT,   // "Games" app: breakout
     BTSCANNER,  // "Bluetooth" app: BLE device scanner
-    BMPVIEW     // "Files" app: BMP image viewer
+    BMPVIEW,    // "Files" app: BMP image viewer
+    PACKETMON   // "PackMon" app: live 802.11 packet-rate graph
 };
 
 extern UIState currentState;
@@ -56,6 +57,7 @@ void drawMiniPiano();
 void drawBLECMD();
 void drawBreakout();
 void drawBTScanner();
+void drawPacketMon();
 void clearContent();
 
 #endif // UI_H
