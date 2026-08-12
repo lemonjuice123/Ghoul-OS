@@ -1,4 +1,4 @@
-# ESP32 Cyberdeck (GHOUL OS)
+# ESP32 Cyberdeck (GHOUL OS) V7.1
 
 A compact ESP32-powered cyberdeck built around a 1.8" ST7735 TFT display and a 4×4 keypad. The goal was to build something small, responsive, and easy to have neccessary apps within a simple navigation adn ui. Everything runs directly from the ESP32, making it a great little platform for experimenting with embedded projects.
 
