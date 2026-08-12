@@ -9,6 +9,8 @@
 //   - Keypad (by Mark Stanley / Alexander Brevig)
 //   - SD and Preferences (both bundled with the ESP32 Arduino core --
 //     nothing extra to install for either)
+//   - WiFi and esp_wifi (also bundled with the ESP32 Arduino core --
+//     used by the "PackMon" app's promiscuous-mode packet monitor)
 //
 // Board: ESP32 Dev Module (ESP32 DevKit V1)
 //
