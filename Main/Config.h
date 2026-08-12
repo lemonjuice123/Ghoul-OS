@@ -166,6 +166,23 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 #define BT_MAX_DEVICES      10
 #define BT_NAME_LEN         17
 
+// ---------------------------- PACKMON APP LAYOUT ----------------------------
+// "PackMon": a live 802.11 packet-rate graph, inspired by
+// spacehuhn/PacketMonitor32. Each history bin is one pixel-wide column
+// on the graph, sampled every PACKETMON_BIN_INTERVAL_MS -- so the full
+// width of the graph shows (PACKETMON_HISTORY_LEN * PACKETMON_BIN_INTERVAL_MS)
+// ms of scrolling strip-chart (150 columns * 200ms = 30s by default).
+#define PACKETMON_GRAPH_X         5
+#define PACKETMON_GRAPH_Y         (CONTENT_TOP + 46)
+#define PACKETMON_GRAPH_W         (SCREEN_WIDTH - 10)
+#define PACKETMON_GRAPH_H         40
+#define PACKETMON_HISTORY_LEN     PACKETMON_GRAPH_W
+#define PACKETMON_BIN_INTERVAL_MS 200UL
+#define PACKETMON_HOP_INTERVAL_MS 2000UL
+#define PACKETMON_GRAPH_MAX_PPS   40   // bin count that fills the graph to full height
+#define PACKETMON_CHANNEL_MIN     1
+#define PACKETMON_CHANNEL_MAX     13
+
 // ---------------------------- ICON DATA FLAG ------------------------------
 // All bitmaps in Icons.h are currently empty placeholders (see project
 // brief). drawIcon() renders a safe vector placeholder glyph instead of
