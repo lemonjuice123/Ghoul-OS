@@ -6,29 +6,33 @@
 // =====================================================================
 // Ghoul OS - Apps.h
 //
-// The application framework. Every entry in the launcher is described
-// by one App struct: a name, a short description, a pointer to its
-// icon bitmap and a launch callback that runs when the user opens it.
+// Declares the App struct/table and every app's launch function.
+// Definitions live in Apps.cpp only -- this header must stay
+// declarations-only, since it's included from multiple translation
+// units (Apps.cpp, GHOULSOS.ino, UI.cpp via UI.h). Defining functions
+// or globals here would give each of those .cpp files its own copy,
+// which the linker rejects as a duplicate ("multiple definition")
+// symbol.
 //
-// TO ADD A NEW APP IN THE FUTURE, you only need to:
-//   1. Add an icon bitmap to Icons.h
-//   2. Add a launch function to Apps.cpp
-//   3. Add one line to the appList[] table in Apps.cpp
-// Nothing else in the project needs to change.
+// NOTE: "Settings" and "Key Test" get real, dedicated screens (theme
+// picker / live keypad visualizer) instead of the generic "Coming
+// Soon" placeholder. UI.cpp recognizes them by comparing their launch
+// function pointer against launchSettings / launchKeyTest, so no
+// other part of the framework needs to know about them specifically.
 // =====================================================================
+
+// Function pointer type used by every app's launch handler.
+typedef void (*AppLaunchFn)();
 
 struct App
 {
-    const char* name;
-    const char* description;
+    const char*   name;
+    const char*   description;
     const uint16_t* icon;
-    void (*launch)();
+    AppLaunchFn   launch;
 };
 
-extern const App appList[];
-extern const uint8_t APP_COUNT;
-
-// Generic placeholder launch handler shared by every app for now.
+// All other apps currently share this generic placeholder behaviour.
 void genericAppLaunch();
 
 void launchWifiScanner();
@@ -40,5 +44,10 @@ void launchBLECMD();
 void launchGames();
 void launchAbout();
 void launchKeyTest();
+void launchPackMon();
+
+// Master application table shown in the launcher carousel, in order.
+extern const App appList[];
+extern const uint8_t APP_COUNT;
 
 #endif // APPS_H
