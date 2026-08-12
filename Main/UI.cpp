@@ -8,6 +8,7 @@
 #include "FileBrowser.h"
 #include "Audio.h"
 #include "BLEKeyboard.h"
+#include "PacketMon.h"
 
 // =====================================================================
 // Ghoul OS - UI.cpp
@@ -171,6 +172,8 @@ static void drawBLECMDRow(uint8_t rowSlot, bool cursorHere);
 static void drawBLECMDList();
 static void drawBTScannerStatus();
 static void drawBTScannerList();
+static void drawPacketMonStatus();
+static void drawPacketMonGraph();
 
 // =====================================================================
 // Lifecycle
@@ -265,6 +268,12 @@ void uiHandleKey(char key)
                 currentState = BREAKOUT;
                 breakoutInit();
                 drawBreakout();
+            }
+            else if (appList[currentAppIndex].launch == launchPackMon)
+            {
+                currentState = PACKETMON;
+                packetMonInit();
+                drawPacketMon();
             }
             else
             {
@@ -395,6 +404,30 @@ void uiHandleKey(char key)
                 drawBTScannerStatus();
                 drawBTScannerList();
             }
+        }
+    }
+    else if (currentState == PACKETMON)
+    {
+        if (key == KEY_BACK)
+        {
+            packetMonDeinit();
+            currentState = MENU;
+            drawMenu(true);
+        }
+        else if (key == KEY_UP)
+        {
+            packetMonNextChannel();
+            drawPacketMonStatus();
+        }
+        else if (key == KEY_DOWN)
+        {
+            packetMonPrevChannel();
+            drawPacketMonStatus();
+        }
+        else if (key == KEY_SELECT)
+        {
+            packetMonSetAutoHop(!packetMonIsAutoHop());
+            drawPacketMonStatus();
         }
     }
     else if (currentState == FILES)
@@ -606,6 +639,17 @@ void uiTick()
         {
             lastBreakoutUpdate = now;
             breakoutTick();
+        }
+    }
+    else if (currentState == PACKETMON)
+    {
+        // packetMonTick() self-throttles to one history bin every
+        // PACKETMON_BIN_INTERVAL_MS and only returns true then, so this
+        // redraws no more often than the graph actually has new data.
+        if (packetMonTick())
+        {
+            drawPacketMonStatus();
+            drawPacketMonGraph();
         }
     }
 }
@@ -1874,6 +1918,75 @@ void drawBTScanner()
 
     tft->setTextColor(COLOR_DIM);
     const char* hint = "5=Connect *=Back";
+    int16_t hx = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
+    tft->setCursor(hx, SCREEN_HEIGHT - 10);
+    tft->print(hint);
+}
+
+// =====================================================================
+// PackMon app -- live 802.11 packet-rate graph (see PacketMon.h/.cpp
+// for the actual sniffing; this only reads its counters and draws).
+// =====================================================================
+
+static void drawPacketMonStatus()
+{
+    tft->fillRect(0, CONTENT_TOP + 12, SCREEN_WIDTH, 24, COLOR_BG);
+    tft->setTextSize(1);
+
+    char line1[24];
+    snprintf(line1, sizeof(line1), "Ch %2u  %s", packetMonGetChannel(),
+              packetMonIsAutoHop() ? "(auto-hop)" : "");
+    tft->setTextColor(COLOR_FG);
+    tft->setCursor(6, CONTENT_TOP + 14);
+    tft->print(line1);
+
+    char line2[24];
+    snprintf(line2, sizeof(line2), "%lu pkt/s  RSSI %d",
+              (unsigned long)packetMonGetPacketRate(), packetMonGetAvgRSSI());
+    tft->setTextColor(COLOR_ACCENT);
+    tft->setCursor(6, CONTENT_TOP + 24);
+    tft->print(line2);
+}
+
+static void drawPacketMonGraph()
+{
+    tft->fillRect(PACKETMON_GRAPH_X, PACKETMON_GRAPH_Y, PACKETMON_GRAPH_W, PACKETMON_GRAPH_H, COLOR_BG);
+    tft->drawRect(PACKETMON_GRAPH_X - 1, PACKETMON_GRAPH_Y - 1,
+                  PACKETMON_GRAPH_W + 2, PACKETMON_GRAPH_H + 2, ICON_BORDER_COLOR);
+
+    uint8_t len = packetMonHistoryLen();
+    for (uint8_t i = 0; i < len && i < PACKETMON_GRAPH_W; i++)
+    {
+        uint8_t count = packetMonHistoryAt(i);
+
+        uint16_t barH = ((uint16_t)count * PACKETMON_GRAPH_H) / PACKETMON_GRAPH_MAX_PPS;
+        if (barH > PACKETMON_GRAPH_H) barH = PACKETMON_GRAPH_H;
+        if (barH == 0) continue;
+
+        int16_t x = PACKETMON_GRAPH_X + i;
+        int16_t yTop = PACKETMON_GRAPH_Y + (PACKETMON_GRAPH_H - barH);
+        tft->drawFastVLine(x, yTop, barH, COLOR_ACCENT);
+    }
+}
+
+void drawPacketMon()
+{
+    clearContent();
+    drawStatusBar();
+
+    tft->setTextSize(1);
+    tft->setTextColor(COLOR_FG);
+    const char* title = "PackMon";
+    int16_t tx = (SCREEN_WIDTH - (int16_t)strlen(title) * 6) / 2;
+    if (tx < 2) tx = 2;
+    tft->setCursor(tx, CONTENT_TOP + 2);
+    tft->print(title);
+
+    drawPacketMonStatus();
+    drawPacketMonGraph();
+
+    tft->setTextColor(COLOR_DIM);
+    const char* hint = "^v=Chan 5=Hop *=Back";
     int16_t hx = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
     tft->setCursor(hx, SCREEN_HEIGHT - 10);
     tft->print(hint);
