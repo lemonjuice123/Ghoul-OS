@@ -7,8 +7,9 @@
 #include "Icons.h"
 #include "FileBrowser.h"
 #include "Audio.h"
-#include "BLEKeyboard.h"
 #include "PacketMon.h"
+#include "WifiScan.h"
+#include "StockWatch.h"
 
 // =====================================================================
 // Ghoul OS - UI.cpp
@@ -29,7 +30,6 @@ UIState currentState = BOOT;
 int8_t currentAppIndex = 0; // app shown while in APP state
 
 static int8_t selectedIndex = 0;  // confirmed/target selection in the menu
-static int8_t lastDrawnLeftIndex = -1; // avoids redrawing left panel needlessly
 
 static float displayIndex = 0.0f;      // animated fractional carousel position
 static int8_t targetIndex = 0;         // where the animation is heading
@@ -61,7 +61,10 @@ static uint8_t filesCursor = 0;     // index into the *displayed* list (incl. ".
 static uint8_t filesScrollTop = 0;  // display index of the first visible row
 
 // ----------------------------- File preview -----------------------------
-#define FILEVIEW_MAX_LINES 40
+// FILEVIEW_MAX_LINES stays comfortably under 255 so fileViewLineCount/
+// filePreviewLineOffset can remain plain uint8_t without any risk of
+// wraparound.
+#define FILEVIEW_MAX_LINES 240
 #define FILEVIEW_LINE_LEN  27
 
 static char filePreviewBuffer[FB_PREVIEW_BUF_SIZE + 1];
@@ -70,6 +73,9 @@ static uint8_t filesViewingEntry = 0; // index into fileEntries[] being previewe
 static char fileViewLines[FILEVIEW_MAX_LINES][FILEVIEW_LINE_LEN];
 static uint8_t fileViewLineCount = 0;
 static uint8_t filePreviewLineOffset = 0; // which wrapped line is scrolled to the top
+static bool filePreviewIsBinary = false;        // content looked like binary, not text
+static bool filePreviewBufferTruncated = false; // file is bigger than FB_PREVIEW_BUF_SIZE
+static bool filePreviewLinesTruncated = false;  // more wrapped lines than FILEVIEW_MAX_LINES allows
 
 // ----------------------------- BMP viewer ---------------------------------
 #define BMP_BATCH 16
@@ -96,57 +102,18 @@ static bool    breakoutGameWon;
 static bool    breakoutGameOver;
 static unsigned long lastBreakoutUpdate = 0;
 
-// ----------------------------- BLECMD state -------------------------------
-#define BLE_ACT_KEY      0
-#define BLE_ACT_CONSUMER 1
-#define BLE_ACT_STRING   2
+// ----------------------------- WiFi Scanner state ---------------------------
+static uint8_t wifiCursor = 0;
+static uint8_t wifiScrollTop = 0;
+static uint16_t wifiMarqueeOffset = 0; // shared ticker position for overflowing SSIDs
 
-struct BleAction {
-    const char* label;
-    uint8_t type;
-    uint8_t modifiers;
-    uint8_t keyCode;
-    uint16_t usageCode;
-    const char* str;
-};
-
-static const BleAction bleActions[] = {
-    { "Volume Up",    BLE_ACT_CONSUMER, 0,    0,    0x00E9, nullptr },
-    { "Volume Down",  BLE_ACT_CONSUMER, 0,    0,    0x00EA, nullptr },
-    { "Mute",         BLE_ACT_CONSUMER, 0,    0,    0x00E2, nullptr },
-    { "Type: haha..", BLE_ACT_STRING,   0,    0,    0,      "haha got your keyboard" },
-    { "Close Window", BLE_ACT_KEY,      0x04, 0x3E, 0,      nullptr },
-    { "Copy",         BLE_ACT_KEY,      0x01, 0x06, 0,      nullptr },
-    { "Paste",        BLE_ACT_KEY,      0x01, 0x19, 0,      nullptr },
-    { "Tab",          BLE_ACT_KEY,      0,    0x2B, 0,      nullptr },
-    { "Escape",       BLE_ACT_KEY,      0,    0x29, 0,      nullptr },
-    { "Enter",        BLE_ACT_KEY,      0,    0x28, 0,      nullptr },
-};
-
-#define BLECMD_ACTION_COUNT (sizeof(bleActions) / sizeof(bleActions[0]))
-
-static uint8_t blecmdCursor = 0;
-static uint8_t blecmdScrollTop = 0;
-static bool blecmdTyping = false;
-static bool blecmdTypeReleasePending = false;
-static const char* blecmdTypeStr = nullptr;
-static uint8_t blecmdTypeIdx = 0;
-static unsigned long blecmdTypeLastTime = 0;
-#define BLECMD_TYPE_PRESS_MS  10
-#define BLECMD_TYPE_INTERVAL  80
-
-static bool blecmdLastConnected = false;
-
-// ----------------------------- BT Scanner state ----------------------------
-static uint8_t btCursor = 0;
-static uint8_t btScrollTop = 0;
+// ----------------------------- StockWatch state -----------------------------
+static uint8_t stockCursor = 0;
+static uint8_t stockScrollTop = 0;
 
 // Forward declarations for internal helpers (not part of the public UI.h API)
-static void drawLeftPanel(bool fullRedraw);
 static void drawScrollbar();
 static void startCarouselAnimation();
-static void wrapDescriptionText(const char* text, uint8_t maxCharsPerLine,
-                                 char lines[][32], uint8_t maxLines, uint8_t* lineCount);
 static void drawKeyTestCell(uint8_t row, uint8_t col, bool highlighted);
 static void handleKeyTestPress(char key);
 static void drawMusicCell(uint8_t row, uint8_t col, bool highlighted);
@@ -159,21 +126,24 @@ static void drawFilesRow(uint8_t rowSlot, bool cursorHere);
 static void refreshFilesRows();
 static void drawFilesReturn();
 static void openFilePreview(uint8_t realIdx);
-static void wrapFileBuffer();
+static bool wrapFileBuffer();
+static bool looksBinary(const char* buf, size_t len);
 static void breakoutInit();
 static void breakoutTick();
 static void breakoutHandleKey(char key);
-static void drawBLECMDStatus();
-static void handleBLECMDKey(char key);
-static uint8_t blecmdKeyToHID(char key);
-static uint8_t charToHIDKey(char c);
-static void blecmdExecuteAction(uint8_t index);
-static void drawBLECMDRow(uint8_t rowSlot, bool cursorHere);
-static void drawBLECMDList();
-static void drawBTScannerStatus();
-static void drawBTScannerList();
+static void breakoutEraseBallAt(int16_t x, int16_t y);
+static void breakoutDrawBallAt(int16_t x, int16_t y);
+static void breakoutErasePaddleAt(int16_t x);
+static void breakoutDrawPaddleAt(int16_t x);
+static void breakoutEraseBrickAt(uint8_t r, uint8_t c);
+static void breakoutUpdateHUD();
+static void breakoutEraseMessageArea();
 static void drawPacketMonStatus();
 static void drawPacketMonGraph();
+static void drawWifiScannerStatus();
+static void drawWifiScannerList();
+static void drawStockWatchStatus();
+static void drawStockWatchList();
 
 // =====================================================================
 // Lifecycle
@@ -196,8 +166,7 @@ void uiHandleKey(char key)
     // Short audio click on every navigation press, the same way small
     // handheld devices (e.g. M5Stick) give audio feedback. Does nothing
     // if audio feedback is currently disabled in Settings.
-    if (currentState != BLECMD &&
-        (key == KEY_UP || key == KEY_DOWN || key == KEY_SELECT || key == KEY_BACK))
+    if (key == KEY_UP || key == KEY_DOWN || key == KEY_SELECT || key == KEY_BACK)
     {
         audioBeepNav();
     }
@@ -245,24 +214,6 @@ void uiHandleKey(char key)
                 currentState = MINIPIANO;
                 drawMiniPiano();
             }
-            else if (appList[currentAppIndex].launch == launchBLECMD)
-            {
-                currentState = BLECMD;
-                blecmdCursor = 0;
-                blecmdScrollTop = 0;
-                blecmdTyping = false;
-                blecmdTypeReleasePending = false;
-                bleKeyboardInit();
-                drawBLECMD();
-            }
-            else if (appList[currentAppIndex].launch == launchBluetooth)
-            {
-                currentState = BTSCANNER;
-                btCursor = 0;
-                btScrollTop = 0;
-                btScannerInit();
-                drawBTScanner();
-            }
             else if (appList[currentAppIndex].launch == launchGames)
             {
                 currentState = BREAKOUT;
@@ -274,6 +225,26 @@ void uiHandleKey(char key)
                 currentState = PACKETMON;
                 packetMonInit();
                 drawPacketMon();
+            }
+            else if (appList[currentAppIndex].launch == launchWifiScanner)
+            {
+                currentState = WIFISCAN;
+                wifiCursor = 0;
+                wifiScrollTop = 0;
+                wifiMarqueeOffset = 0;
+                wifiScanInit();
+                drawWifiScanner();
+            }
+            else if (appList[currentAppIndex].launch == launchStockWatch)
+            {
+                currentState = STOCKWATCH;
+                stockCursor = 0;
+                stockScrollTop = 0;
+                stockWatchPrepareRefresh(); // instant -- shows "Connecting..." below
+                drawStockWatch();
+                stockWatchRefresh();        // blocking: WiFi connect + HTTPS fetches
+                drawStockWatchStatus();
+                drawStockWatchList();
             }
             else
             {
@@ -334,19 +305,6 @@ void uiHandleKey(char key)
             handleMusicKeyPress(key);
         }
     }
-    else if (currentState == BLECMD)
-    {
-        if (key == KEY_BACK)
-        {
-            bleKeyboardDeinit();
-            currentState = MENU;
-            drawMenu(true);
-        }
-        else
-        {
-            handleBLECMDKey(key);
-        }
-    }
     else if (currentState == BREAKOUT)
     {
         if (key == KEY_BACK)
@@ -357,53 +315,6 @@ void uiHandleKey(char key)
         else
         {
             breakoutHandleKey(key);
-        }
-    }
-    else if (currentState == BTSCANNER)
-    {
-        if (key == KEY_BACK)
-        {
-            btScannerDisconnect();
-            btScannerDeinit();
-            currentState = MENU;
-            drawMenu(true);
-        }
-        else if (key == KEY_UP)
-        {
-            if (btCursor > 0)
-            {
-                btCursor--;
-                if (btCursor < btScrollTop) btScrollTop = btCursor;
-                drawBTScannerList();
-            }
-        }
-        else if (key == KEY_DOWN)
-        {
-            uint8_t count = btScannerDeviceCount();
-            if (count > 0 && btCursor < count - 1)
-            {
-                btCursor++;
-                if (btCursor >= btScrollTop + BT_VISIBLE_ROWS)
-                    btScrollTop = btCursor - BT_VISIBLE_ROWS + 1;
-                drawBTScannerList();
-            }
-        }
-        else if (key == KEY_SELECT)
-        {
-            if (!btScannerIsConnected() && btScannerDeviceCount() > 0)
-            {
-                tft->setTextSize(1);
-                tft->setTextColor(COLOR_FG);
-                const char* msg = "Connecting...";
-                tft->fillRect(0, CONTENT_TOP + 12, SCREEN_WIDTH, 12, COLOR_BG);
-                int16_t mx = (SCREEN_WIDTH - (int16_t)strlen(msg) * 6) / 2;
-                tft->setCursor(mx, CONTENT_TOP + 14);
-                tft->print(msg);
-
-                btScannerConnect(btCursor);
-                drawBTScannerStatus();
-                drawBTScannerList();
-            }
         }
     }
     else if (currentState == PACKETMON)
@@ -428,6 +339,90 @@ void uiHandleKey(char key)
         {
             packetMonSetAutoHop(!packetMonIsAutoHop());
             drawPacketMonStatus();
+        }
+    }
+    else if (currentState == WIFISCAN)
+    {
+        if (key == KEY_BACK)
+        {
+            wifiScanDeinit();
+            currentState = MENU;
+            drawMenu(true);
+        }
+        else if (key == KEY_UP)
+        {
+            if (wifiCursor > 0)
+            {
+                wifiCursor--;
+                if (wifiCursor < wifiScrollTop) wifiScrollTop = wifiCursor;
+                wifiMarqueeOffset = 0; // restart the ticker so the newly-selected row reads from the start
+                drawWifiScannerList();
+            }
+        }
+        else if (key == KEY_DOWN)
+        {
+            uint8_t count = wifiScanNetworkCount();
+            if (count > 0 && wifiCursor < count - 1)
+            {
+                wifiCursor++;
+                if (wifiCursor >= wifiScrollTop + WIFI_VISIBLE_ROWS)
+                    wifiScrollTop = wifiCursor - WIFI_VISIBLE_ROWS + 1;
+                wifiMarqueeOffset = 0;
+                drawWifiScannerList();
+            }
+        }
+        else if (key == KEY_SELECT)
+        {
+            // Trigger a fresh scan (a no-op while one is already running).
+            if (!wifiScanIsScanning())
+            {
+                wifiCursor = 0;
+                wifiScrollTop = 0;
+                wifiMarqueeOffset = 0;
+                wifiScanStart();
+                drawWifiScannerStatus();
+                drawWifiScannerList();
+            }
+        }
+    }
+    else if (currentState == STOCKWATCH)
+    {
+        if (key == KEY_BACK)
+        {
+            stockWatchDeinit();
+            currentState = MENU;
+            drawMenu(true);
+        }
+        else if (key == KEY_UP)
+        {
+            if (stockCursor > 0)
+            {
+                stockCursor--;
+                if (stockCursor < stockScrollTop) stockScrollTop = stockCursor;
+                drawStockWatchList();
+            }
+        }
+        else if (key == KEY_DOWN)
+        {
+            uint8_t count = stockWatchCount();
+            if (count > 0 && stockCursor < count - 1)
+            {
+                stockCursor++;
+                if (stockCursor >= stockScrollTop + STOCK_VISIBLE_ROWS)
+                    stockScrollTop = stockCursor - STOCK_VISIBLE_ROWS + 1;
+                drawStockWatchList();
+            }
+        }
+        else if (key == KEY_SELECT)
+        {
+            // Manual refresh -- pulls fresh prices for every symbol again.
+            stockCursor = 0;
+            stockScrollTop = 0;
+            stockWatchPrepareRefresh();
+            drawStockWatchStatus();
+            stockWatchRefresh();
+            drawStockWatchStatus();
+            drawStockWatchList();
         }
     }
     else if (currentState == FILES)
@@ -580,59 +575,6 @@ void uiTick()
             drawStatusBar();
         }
     }
-    else if (currentState == BLECMD)
-    {
-        if (bleKeyboardIsConnected() != blecmdLastConnected)
-        {
-            drawBLECMDStatus();
-        }
-
-        if (blecmdTyping)
-        {
-            if (blecmdTypeReleasePending)
-            {
-                if (now - blecmdTypeLastTime >= BLECMD_TYPE_PRESS_MS)
-                {
-                    bleKeyboardReleaseKey();
-                    blecmdTypeReleasePending = false;
-                    blecmdTypeIdx++;
-                    blecmdTypeLastTime = now;
-                }
-            }
-            else if (now - blecmdTypeLastTime >= BLECMD_TYPE_INTERVAL)
-            {
-                blecmdTypeLastTime = now;
-                if (blecmdTypeStr == nullptr || blecmdTypeStr[blecmdTypeIdx] == '\0')
-                {
-                    blecmdTyping = false;
-                    drawBLECMDStatus();
-                }
-                else
-                {
-                    uint8_t hidCode = charToHIDKey(blecmdTypeStr[blecmdTypeIdx]);
-                    if (hidCode != 0)
-                    {
-                        bleKeyboardSendKey(0, hidCode);
-                        blecmdTypeReleasePending = true;
-                    }
-                    else
-                    {
-                        blecmdTypeIdx++;
-                    }
-                }
-            }
-        }
-    }
-    else if (currentState == BTSCANNER)
-    {
-        static unsigned long lastBtRefresh = 0;
-        if (now - lastBtRefresh >= 1000)
-        {
-            lastBtRefresh = now;
-            drawBTScannerStatus();
-            drawBTScannerList();
-        }
-    }
     else if (currentState == BREAKOUT)
     {
         if (now - lastBreakoutUpdate >= 50)
@@ -652,6 +594,28 @@ void uiTick()
             drawPacketMonGraph();
         }
     }
+    else if (currentState == WIFISCAN)
+    {
+        // A scan just finished -- refresh the status line and results.
+        if (wifiScanTick())
+        {
+            drawWifiScannerStatus();
+            drawWifiScannerList();
+        }
+
+        // Advance the shared marquee ticker and redraw the list so any
+        // SSID too long to fit its row keeps scrolling smoothly. This is
+        // already capped to ~30 FPS by the FRAME_INTERVAL_MS gate above,
+        // so we only need our own slower WIFI_MARQUEE_STEP_MS throttle
+        // on top of that.
+        static unsigned long lastWifiMarquee = 0;
+        if (now - lastWifiMarquee >= WIFI_MARQUEE_STEP_MS)
+        {
+            lastWifiMarquee = now;
+            wifiMarqueeOffset++;
+            drawWifiScannerList();
+        }
+    }
 }
 
 // =====================================================================
@@ -660,20 +624,11 @@ void uiTick()
 
 void drawBoot()
 {
-    tft->fillScreen(COLOR_BG);
-
-    // Full-screen splash bitmap (currently an empty placeholder, see
-    // Icons.h). drawIcon() safely falls back to a vector placeholder
-    // when ICONS_HAVE_DATA is 0.
-    drawIcon(0, 0, bootLogo, SCREEN_WIDTH, SCREEN_HEIGHT);
-
-    // Branding text drawn on top so the splash still looks intentional
-    // while the real logo bitmap is empty.
-    
-    
-
-   
-    
+    // Full-screen boot logo, blitted from the RGB565 PROGMEM array in
+    // Icons.h (bootLogo -- already sized to exactly SCREEN_WIDTH x
+    // SCREEN_HEIGHT, 20480 entries). Shown for BOOT_SPLASH_DURATION_MS
+    // (see Config.h) before uiTick() switches over to MENU.
+    drawBitmapIcon(0, 0, bootLogo, SCREEN_WIDTH, SCREEN_HEIGHT);
 }
 
 // =====================================================================
@@ -695,34 +650,32 @@ void drawStatusBar()
     tft->setCursor(4, 3);
     tft->print(clockBuf);
 
-    // Hollow-box status indicators: filled blue when active, dim outline when off.
+    // Hollow-box status indicators: filled green when active, dim
+    // outline when off -- sharp rectangles to match the rest of the
+    // theme, not rounded pills.
     uint8_t sz = STATUSBAR_ICON_SIZE - 2;
     int16_t iy = (STATUSBAR_HEIGHT - sz) / 2;
     int16_t x = SCREEN_WIDTH - 4 - sz;
 
     // Battery (no sensor -- always dim hollow)
-    tft->drawRoundRect(x, iy, sz, sz, 1, COLOR_DIM);
+    tft->drawRect(x, iy, sz, sz, COLOR_DIM);
     x -= (sz + 4);
 
-    // WiFi (no stack active yet -- always dim hollow)
-    tft->drawRoundRect(x, iy, sz, sz, 1, COLOR_DIM);
-    x -= (sz + 4);
-
-    // Bluetooth (filled when BLE keyboard or scanner is active)
-    uint16_t btColor = (bleKeyboardIsActive() || btScannerIsActive()) ? COLOR_ACCENT : COLOR_DIM;
-    tft->drawRoundRect(x, iy, sz, sz, 1, btColor);
-    if (bleKeyboardIsActive() || btScannerIsActive())
+    // WiFi (filled while the WiFi Scanner app has the radio open)
+    uint16_t wifiColor = wifiScanIsActive() ? COLOR_ACCENT : COLOR_DIM;
+    tft->drawRect(x, iy, sz, sz, wifiColor);
+    if (wifiScanIsActive())
     {
-        tft->fillRoundRect(x + 1, iy + 1, sz - 2, sz - 2, 1, btColor);
+        tft->fillRect(x + 1, iy + 1, sz - 2, sz - 2, wifiColor);
     }
     x -= (sz + 4);
 
     // SD card (filled when card is present and ready)
     uint16_t sdColor = sdReady ? COLOR_ACCENT : COLOR_DIM;
-    tft->drawRoundRect(x, iy, sz, sz, 1, sdColor);
+    tft->drawRect(x, iy, sz, sz, sdColor);
     if (sdReady)
     {
-        tft->fillRoundRect(x + 1, iy + 1, sz - 2, sz - 2, 1, sdColor);
+        tft->fillRect(x + 1, iy + 1, sz - 2, sz - 2, sdColor);
     }
 }
 
@@ -736,157 +689,31 @@ void drawMenu(bool fullRedraw)
     {
         clearContent();
         drawStatusBar();
-        lastDrawnLeftIndex = -1; // force the left panel to redraw
     }
 
-    drawLeftPanel(fullRedraw);
     drawCarousel(fullRedraw);
 }
-
-// --- Left panel: big icon and description of the selected app ---
-static void drawLeftPanel(bool fullRedraw)
-{
-    if (!fullRedraw && lastDrawnLeftIndex == selectedIndex)
-    {
-        return;
-    }
-
-    lastDrawnLeftIndex = selectedIndex;
-
-    tft->fillRect(
-        LEFT_PANEL_X,
-        CONTENT_TOP,
-        LEFT_PANEL_W,
-        CONTENT_HEIGHT,
-        COLOR_BG
-    );
-
-    drawDescription();
-}
-
-void drawDescription()
-{
-    const App &app = appList[selectedIndex];
-
-    // Fill the entire left panel.
-    // Leave exactly 1 pixel below the status bar
-    // and 4 pixels above the bottom.
-
-    int16_t boxX = LEFT_PANEL_X;
-    int16_t boxY = CONTENT_TOP + 1;
-    int16_t boxW = LEFT_PANEL_W;
-    int16_t boxH = CONTENT_HEIGHT - 5;
-
-    tft->drawRoundRect(boxX, boxY,
-                       boxW, boxH,
-                       ICON_BORDER_RADIUS,
-                       ICON_BORDER_COLOR);
-
-    uint8_t maxCharsPerLine = (boxW - 8) / 6;
-    if (maxCharsPerLine < 4)
-        maxCharsPerLine = 4;
-
-    char lines[12][32];
-    uint8_t lineCount = 0;
-
-    wrapDescriptionText(app.description,
-                        maxCharsPerLine,
-                        lines,
-                        12,
-                        &lineCount);
-
-    tft->setTextSize(1);
-    tft->setTextColor(COLOR_FG);
-
-    int16_t y = boxY + 6;
-
-    // Draw title
-    tft->setCursor(boxX + 5, y);
-    tft->print(app.name);
-
-    y += 12;
-
-    // Divider
-    tft->drawFastHLine(boxX + 3,
-                       y,
-                       boxW - 6,
-                       COLOR_DIM);
-
-    y += 6;
-
-    // Description
-    tft->setTextColor(COLOR_DIM);
-
-    for(uint8_t i = 0; i < lineCount; i++)
-    {
-        if(y + 8 > boxY + boxH - 4)
-            break;
-
-        tft->setCursor(boxX + 5, y);
-        tft->print(lines[i]);
-        y += 9;
-    }
-}
-
-// Simple greedy word-wrap into a fixed-size buffer of lines.
-static void wrapDescriptionText(const char* text, uint8_t maxCharsPerLine,
-                                 char lines[][32], uint8_t maxLines, uint8_t* lineCount)
-{
-    *lineCount = 0;
-    size_t textLen = strlen(text);
-    size_t pos = 0;
-
-    while (pos < textLen && *lineCount < maxLines)
-    {
-        size_t remaining = textLen - pos;
-        size_t take = remaining < maxCharsPerLine ? remaining : maxCharsPerLine;
-
-        // Try to break on a space so words are not split mid-word.
-        if (take < remaining)
-        {
-            size_t breakAt = take;
-            while (breakAt > 0 && text[pos + breakAt] != ' ')
-            {
-                breakAt--;
-            }
-            if (breakAt > 0)
-            {
-                take = breakAt;
-            }
-        }
-
-        size_t copyLen = take < 31 ? take : 31;
-        memcpy(lines[*lineCount], &text[pos], copyLen);
-        lines[*lineCount][copyLen] = '\0';
-        (*lineCount)++;
-
-        pos += take;
-        while (pos < textLen && text[pos] == ' ')
-        {
-            pos++; // skip the space we broke on
-        }
-    }
-}
-
-// --- Right panel: animated vertical list of app names -----------------
+// --- The launcher is just this: a centered, animated vertical list of
+// app names. No icons, no side panel -- text-only retro terminal menu.
 void drawCarousel(bool fullRedraw)
 {
     (void)fullRedraw; // the carousel always repaints just its own panel
 
-    // Partial redraw: clear only the right panel, never the full screen.
+    // Partial redraw: clear only the menu panel, never the full screen.
     tft->fillRect(RIGHT_PANEL_X, CONTENT_TOP, RIGHT_PANEL_W, CONTENT_HEIGHT, COLOR_BG);
 
     // Fixed highlight box behind the centered (selected) row. It stays
-    // put while the list slides underneath it -- same idea as the old
-    // dot carousel's ring, just now sized to hold a line of text.
+    // put while the list slides underneath it.
     drawSelection();
 
     float centerY = CONTENT_TOP + CONTENT_HEIGHT / 2.0f;
 
     // Reserve room for the scrollbar + a gap so text never runs under it.
-    int16_t textAreaX = RIGHT_PANEL_X + 3;
+    // Carousel text is drawn at size 2 (12px/char) now that it no
+    // longer has to share the screen with an icon/description panel.
+    int16_t textAreaX = RIGHT_PANEL_X + 4;
     int16_t textAreaRight = SCREEN_WIDTH - SCROLLBAR_WIDTH - SCROLLBAR_GAP - 2;
-    uint8_t maxChars = (uint8_t)((textAreaRight - textAreaX) / 6);
+    uint8_t maxChars = (uint8_t)((textAreaRight - textAreaX) / 12);
     if (maxChars < 1) maxChars = 1;
     if (maxChars > 15) maxChars = 15;
 
@@ -905,9 +732,9 @@ void drawCarousel(bool fullRedraw)
 
         // Hard clip at the content/status-bar boundary: a row that would
         // overlap the status bar is skipped entirely rather than drawn
-        // and left to smear, since the right-panel clear above only
-        // touches the content area, never the status bar itself.
-        if (y - 4 < CONTENT_TOP || y > SCREEN_HEIGHT - 2)
+        // and left to smear, since the panel clear above only touches
+        // the content area, never the status bar itself.
+        if (y - 8 < CONTENT_TOP || y > SCREEN_HEIGHT - 2)
         {
             continue;
         }
@@ -938,9 +765,9 @@ void drawCarousel(bool fullRedraw)
             label[copyLen] = '\0';
         }
 
-        tft->setTextSize(1);
+        tft->setTextSize(2);
         tft->setTextColor(color);
-        tft->setCursor(textAreaX, (int16_t)y - 3);
+        tft->setCursor(textAreaX, (int16_t)y - 8);
         tft->print(label);
     }
 
@@ -953,7 +780,8 @@ void drawCarousel(bool fullRedraw)
     drawStatusBar();
 }
 
-// Fixed highlight box behind the centered/selected row in the list.
+// Fixed highlight box behind the centered/selected row in the list --
+// a sharp-cornered rectangle, matching the rest of the retro theme.
 void drawSelection()
 {
     float centerY = CONTENT_TOP + CONTENT_HEIGHT / 2.0f;
@@ -963,12 +791,12 @@ void drawSelection()
     int16_t boxH = CAROUSEL_ITEM_H - 2;
     int16_t boxY = (int16_t)(centerY - boxH / 2.0f);
 
-    tft->fillRoundRect(boxX, boxY, boxW, boxH, 3, COLOR_SELECT_BG);
-    tft->drawRoundRect(boxX, boxY, boxW, boxH, 3, COLOR_ACCENT_DIM);
+    tft->fillRect(boxX, boxY, boxW, boxH, COLOR_SELECT_BG);
+    tft->drawRect(boxX, boxY, boxW, boxH, COLOR_ACCENT_DIM);
 }
 
 // Vertical scrollbar along the rightmost edge showing progress through
-// the full app list.
+// the full app list -- a solid rectangle thumb, not a rounded pill.
 static void drawScrollbar()
 {
     int16_t trackX = SCREEN_WIDTH - SCROLLBAR_WIDTH - 1;
@@ -985,9 +813,10 @@ static void drawScrollbar()
     if (progress < 0.0f) progress = 0.0f;
     if (progress > 1.0f) progress = 1.0f;
 
+
     int16_t thumbY = trackY + (int16_t)(progress * (trackH - thumbH));
 
-    tft->fillRoundRect(trackX, thumbY, SCROLLBAR_WIDTH, thumbH, 1, COLOR_ACCENT);
+    tft->fillRect(trackX, thumbY, SCROLLBAR_WIDTH, thumbH, COLOR_ACCENT);
 }
 
 // =====================================================================
@@ -1000,10 +829,6 @@ static void startCarouselAnimation()
     animStartValue = displayIndex;
     animStartTime = millis();
     animating = true;
-
-    // The left panel (icon/description) updates immediately so it
-    // reads correctly for the whole duration of the list's slide.
-    drawLeftPanel(false);
 }
 
 // Advances displayIndex toward targetIndex using an ease-out curve.
@@ -1048,31 +873,33 @@ void drawApp()
     // About screen: show device info instead of generic placeholder
     if (app.launch == launchAbout)
     {
+        tft->drawRect(4, CONTENT_TOP + 4, SCREEN_WIDTH - 8, CONTENT_HEIGHT - 20, COLOR_ACCENT_DIM);
+
         tft->setTextSize(2);
-        tft->setTextColor(COLOR_FG);
-        const char* title = "GhoulOS";
+        tft->setTextColor(COLOR_ACCENT);
+        const char* title = "GHOUL OS";
         int16_t tx = (SCREEN_WIDTH - (int16_t)strlen(title) * 12) / 2;
         if (tx < 2) tx = 2;
-        tft->setCursor(tx, CONTENT_TOP + 10);
+        tft->setCursor(tx, CONTENT_TOP + 12);
         tft->print(title);
 
         tft->setTextSize(1);
-        tft->setTextColor(COLOR_DIM);
-        int16_t y = CONTENT_TOP + 34;
-        tft->setCursor(8, y);  tft->print("Platform: ESP32");       y += 10;
-        tft->setCursor(8, y);  tft->print("Display: ST7735 160x128"); y += 10;
-        tft->setCursor(8, y);  tft->print("Input: 4x4 Matrix Pad"); y += 10;
+        tft->setTextColor(COLOR_FG);
+        int16_t y = CONTENT_TOP + 36;
+        tft->setCursor(10, y);  tft->print("Platform: ESP32");       y += 10;
+        tft->setCursor(10, y);  tft->print("Display: ST7735 160x128"); y += 10;
+        tft->setCursor(10, y);  tft->print("Input: 4x4 Matrix Pad"); y += 10;
 
         char heapBuf[28];
         snprintf(heapBuf, sizeof(heapBuf), "Free heap: %lu B",
                  (unsigned long)ESP.getFreeHeap());
-        tft->setCursor(8, y);  tft->print(heapBuf);                 y += 10;
+        tft->setCursor(10, y);  tft->print(heapBuf);                 y += 10;
 
         uint16_t umins = (secondsSinceBoot / 60) % 100;
         uint16_t usecs = secondsSinceBoot % 60;
         char upBuf[20];
         snprintf(upBuf, sizeof(upBuf), "Uptime: %02u:%02u", umins, usecs);
-        tft->setCursor(8, y);  tft->print(upBuf);
+        tft->setCursor(10, y);  tft->print(upBuf);
 
         tft->setTextColor(COLOR_DIM);
         char hint[16];
@@ -1083,28 +910,26 @@ void drawApp()
         return;
     }
 
-    // Generic placeholder screen for every other app.
+    // Generic placeholder screen for every other app -- a bordered
+    // retro panel with the app name as a big centered header and a
+    // "*** COMING SOON ***" banner underneath, text-only (no icon).
+    int16_t boxY = CONTENT_TOP + 10;
+    int16_t boxH = CONTENT_HEIGHT - 30;
+    tft->drawRect(8, boxY, SCREEN_WIDTH - 16, boxH, COLOR_ACCENT_DIM);
 
-    // Large centered icon.
-    int16_t iconX = (SCREEN_WIDTH - APP_SCREEN_ICON_SIZE) / 2;
-    int16_t iconY = CONTENT_TOP + 10;
-    drawIcon(iconX, iconY, app.icon, APP_SCREEN_ICON_SIZE, APP_SCREEN_ICON_SIZE);
-
-    // App title, centered.
     tft->setTextSize(2);
-    tft->setTextColor(COLOR_FG);
-    int16_t titleY = iconY + APP_SCREEN_ICON_SIZE + 8;
+    tft->setTextColor(COLOR_ACCENT);
+    int16_t titleY = boxY + (boxH / 2) - 20;
     int16_t titleX = (SCREEN_WIDTH - (int16_t)strlen(app.name) * 12) / 2;
     if (titleX < 2) titleX = 2;
     tft->setCursor(titleX, titleY);
     tft->print(app.name);
 
-    // "Coming Soon" caption, centered.
     tft->setTextSize(1);
-    tft->setTextColor(COLOR_ACCENT);
-    const char* caption = "Coming Soon";
+    tft->setTextColor(COLOR_FG);
+    const char* caption = "*** COMING SOON ***";
     int16_t capX = (SCREEN_WIDTH - (int16_t)strlen(caption) * 6) / 2;
-    tft->setCursor(capX, titleY + 20);
+    tft->setCursor(capX, titleY + 26);
     tft->print(caption);
 
     // Back hint at the bottom of the screen.
@@ -1134,8 +959,8 @@ static void drawKeyTestCell(uint8_t row, uint8_t col, bool highlighted)
     uint16_t borderColor = highlighted ? COLOR_ACCENT : COLOR_DIM;
     uint16_t textColor   = highlighted ? COLOR_BG : COLOR_FG;
 
-    tft->fillRoundRect(x, y, w, h, 3, fillColor);
-    tft->drawRoundRect(x, y, w, h, 3, borderColor);
+    tft->fillRect(x, y, w, h, fillColor);
+    tft->drawRect(x, y, w, h, borderColor);
 
     char label[2] = { keyTestLayout[row][col], '\0' };
     tft->setTextSize(1);
@@ -1227,8 +1052,8 @@ static void drawMusicCell(uint8_t row, uint8_t col, bool highlighted)
     uint16_t borderColor = highlighted ? COLOR_ACCENT : COLOR_DIM;
     uint16_t textColor   = highlighted ? COLOR_BG : COLOR_FG;
 
-    tft->fillRoundRect(x, y, w, h, 3, fillColor);
-    tft->drawRoundRect(x, y, w, h, 3, borderColor);
+    tft->fillRect(x, y, w, h, fillColor);
+    tft->drawRect(x, y, w, h, borderColor);
 
     // Key number, upper area of the cell.
     char keyLabel[2] = { (char)('1' + noteIndex), '\0' };
@@ -1317,7 +1142,7 @@ static void drawAudioToggleRow()
     // Clear the whole toggle area before repainting it.
     tft->fillRect(0, SETTINGS_TOGGLE_Y - 4, SCREEN_WIDTH, 56, COLOR_BG);
 
-    const char* label = "Audio Feedback";
+    const char* label = "AUDIO FEEDBACK";
     tft->setTextSize(1);
     tft->setTextColor(COLOR_FG);
     int16_t lx = (SCREEN_WIDTH - (int16_t)strlen(label) * 6) / 2;
@@ -1327,25 +1152,23 @@ static void drawAudioToggleRow()
 
     bool on = audioIsEnabled();
 
-    int16_t pillW = 40;
-    int16_t pillH = 18;
-    int16_t pillX = (SCREEN_WIDTH - pillW) / 2;
-    int16_t pillY = SETTINGS_TOGGLE_Y + 14;
+    // Bracketed "[ ON ]" / "[ OFF ]" toggle box -- sharp rectangle,
+    // matching the rest of the theme instead of a rounded pill switch.
+    char boxText[8];
+    snprintf(boxText, sizeof(boxText), "[ %s ]", on ? "ON" : "OFF");
 
-    tft->fillRoundRect(pillX, pillY, pillW, pillH, pillH / 2, on ? COLOR_ACCENT : COLOR_DIM);
-    tft->drawRoundRect(pillX, pillY, pillW, pillH, pillH / 2, COLOR_FG);
+    tft->setTextSize(2);
+    int16_t boxW = (int16_t)strlen(boxText) * 12 + 12;
+    int16_t boxH = 26;
+    int16_t boxX = (SCREEN_WIDTH - boxW) / 2;
+    int16_t boxY = SETTINGS_TOGGLE_Y + 14;
 
-    // Knob slides to the right when on, left when off.
-    int16_t knobD = pillH - 4;
-    int16_t knobX = on ? (pillX + pillW - knobD - 2) : (pillX + 2);
-    int16_t knobY = pillY + 2;
-    tft->fillRoundRect(knobX, knobY, knobD, knobD, knobD / 2, COLOR_BG);
+    tft->fillRect(boxX, boxY, boxW, boxH, on ? COLOR_SELECT_BG : COLOR_BG);
+    tft->drawRect(boxX, boxY, boxW, boxH, on ? COLOR_ACCENT : COLOR_DIM);
 
-    tft->setTextColor(COLOR_DIM);
-    const char* stateText = on ? "ON" : "OFF";
-    int16_t sx = (SCREEN_WIDTH - (int16_t)strlen(stateText) * 6) / 2;
-    tft->setCursor(sx, pillY + pillH + 6);
-    tft->print(stateText);
+    tft->setTextColor(on ? COLOR_ACCENT : COLOR_DIM);
+    tft->setCursor(boxX + 6, boxY + 5);
+    tft->print(boxText);
 }
 
 void drawSettings()
@@ -1417,10 +1240,10 @@ void drawBreakout()
     tft->print(hud);
 
     // Play-area border
-    tft->drawRoundRect(BREAKOUT_PLAY_X - 1, BREAKOUT_PLAY_Y - 1,
-                       BREAKOUT_PLAY_W + 2, BREAKOUT_PLAY_H + 2, 2, COLOR_DIM);
+    tft->drawRect(BREAKOUT_PLAY_X - 1, BREAKOUT_PLAY_Y - 1,
+                  BREAKOUT_PLAY_W + 2, BREAKOUT_PLAY_H + 2, COLOR_DIM);
 
-    // Bricks
+    // Bricks -- a red-to-green heat ramp, no blue/cyan anywhere.
     for (uint8_t r = 0; r < BREAKOUT_BRICK_ROWS; r++)
     {
         for (uint8_t c = 0; c < BREAKOUT_BRICK_COLS; c++)
@@ -1434,19 +1257,19 @@ void drawBreakout()
             switch (r)
             {
                 case 0:  color = 0xF800; break; // red
-                case 1:  color = 0xFFE0; break; // yellow
-                case 2:  color = 0x07E0; break; // green
-                default: color = 0x07FF; break; // cyan
+                case 1:  color = 0xFD20; break; // amber
+                case 2:  color = 0xFFE0; break; // yellow
+                default: color = 0x07E0; break; // green
             }
 
-            tft->fillRoundRect(bx, by, BREAKOUT_BRICK_W, BREAKOUT_BRICK_H, 1, color);
+            tft->fillRect(bx, by, BREAKOUT_BRICK_W, BREAKOUT_BRICK_H, color);
         }
     }
 
     // Paddle
     int16_t paddleY = BREAKOUT_PLAY_Y + BREAKOUT_PLAY_H - BREAKOUT_PADDLE_H;
-    tft->fillRoundRect(breakoutPaddleX, paddleY,
-                       BREAKOUT_PADDLE_W, BREAKOUT_PADDLE_H, 2, COLOR_ACCENT);
+    tft->fillRect(breakoutPaddleX, paddleY,
+                  BREAKOUT_PADDLE_W, BREAKOUT_PADDLE_H, COLOR_ACCENT);
 
     // Ball
     tft->fillRect(breakoutBallX, breakoutBallY,
@@ -1490,6 +1313,75 @@ void drawBreakout()
     tft->print(hint);
 }
 
+// ---------------------------------------------------------------------
+// Targeted, single-rect redraws used by breakoutHandleKey()/breakoutTick()
+// once the game is running, so a normal frame only touches the few
+// pixels that actually changed (the ball, or a moved paddle, or one
+// destroyed brick) instead of calling drawBreakout() and repainting the
+// whole play field -- that repeated full-screen clear+redraw is what
+// caused the visible flash every ~50ms.
+// ---------------------------------------------------------------------
+
+static void breakoutEraseBallAt(int16_t x, int16_t y)
+{
+    tft->fillRect(x, y, BREAKOUT_BALL_SIZE, BREAKOUT_BALL_SIZE, COLOR_BG);
+}
+
+static void breakoutDrawBallAt(int16_t x, int16_t y)
+{
+    tft->fillRect(x, y, BREAKOUT_BALL_SIZE, BREAKOUT_BALL_SIZE, COLOR_FG);
+}
+
+static void breakoutErasePaddleAt(int16_t x)
+{
+    int16_t paddleY = BREAKOUT_PLAY_Y + BREAKOUT_PLAY_H - BREAKOUT_PADDLE_H;
+    tft->fillRect(x, paddleY, BREAKOUT_PADDLE_W, BREAKOUT_PADDLE_H, COLOR_BG);
+}
+
+static void breakoutDrawPaddleAt(int16_t x)
+{
+    int16_t paddleY = BREAKOUT_PLAY_Y + BREAKOUT_PLAY_H - BREAKOUT_PADDLE_H;
+    tft->fillRect(x, paddleY, BREAKOUT_PADDLE_W, BREAKOUT_PADDLE_H, COLOR_ACCENT);
+}
+
+static void breakoutEraseBrickAt(uint8_t r, uint8_t c)
+{
+    int16_t bx = BREAKOUT_PLAY_X + c * (BREAKOUT_BRICK_W + BREAKOUT_BRICK_GAP);
+    int16_t by = BREAKOUT_PLAY_Y + r * (BREAKOUT_BRICK_H + BREAKOUT_BRICK_GAP);
+    tft->fillRect(bx, by, BREAKOUT_BRICK_W, BREAKOUT_BRICK_H, COLOR_BG);
+}
+
+static void breakoutUpdateHUD()
+{
+    // Fixed-width erase (rather than sizing the rect to the new string)
+    // so old digits never show through even when the new text is
+    // shorter than what was there before -- e.g. lives dropping from
+    // "10" to "9" wouldn't fully overwrite a longer previous string.
+    const int16_t hudW = 90;
+    int16_t hudX = SCREEN_WIDTH - hudW;
+    tft->fillRect(hudX, CONTENT_TOP + 2, hudW - 2, 8, COLOR_BG);
+
+    char hud[24];
+    snprintf(hud, sizeof(hud), "%u  Lives:%u", breakoutScore, breakoutLives);
+    int16_t hx = SCREEN_WIDTH - (int16_t)strlen(hud) * 6 - 4;
+
+    tft->setTextSize(1);
+    tft->setTextColor(COLOR_FG);
+    tft->setCursor(hx, CONTENT_TOP + 2);
+    tft->print(hud);
+}
+
+static void breakoutEraseMessageArea()
+{
+    // Generously-sized erase covering where either the "Press 5 to
+    // launch" prompt could sit, centered in the play field.
+    const char* msg = "Press 5 to launch";
+    int16_t mw = (int16_t)strlen(msg) * 6;
+    int16_t mx = (SCREEN_WIDTH - mw) / 2;
+    int16_t my = BREAKOUT_PLAY_Y + BREAKOUT_PLAY_H / 2 - 4;
+    tft->fillRect(mx - 2, my - 1, mw + 4, 10, COLOR_BG);
+}
+
 static void breakoutHandleKey(char key)
 {
     if (breakoutGameOver || breakoutGameWon) return;
@@ -1497,27 +1389,48 @@ static void breakoutHandleKey(char key)
     int16_t moveStep = BREAKOUT_PADDLE_W / 2;
     int16_t maxX = BREAKOUT_PLAY_X + BREAKOUT_PLAY_W - BREAKOUT_PADDLE_W;
 
-    if (key == '4')
+    if (key == '4' || key == '6')
     {
-        breakoutPaddleX -= moveStep;
-        if (breakoutPaddleX < BREAKOUT_PLAY_X) breakoutPaddleX = BREAKOUT_PLAY_X;
-    }
-    else if (key == '6')
-    {
-        breakoutPaddleX += moveStep;
-        if (breakoutPaddleX > maxX) breakoutPaddleX = maxX;
+        int16_t oldX = breakoutPaddleX;
+
+        if (key == '4')
+        {
+            breakoutPaddleX -= moveStep;
+            if (breakoutPaddleX < BREAKOUT_PLAY_X) breakoutPaddleX = BREAKOUT_PLAY_X;
+        }
+        else
+        {
+            breakoutPaddleX += moveStep;
+            if (breakoutPaddleX > maxX) breakoutPaddleX = maxX;
+        }
+
+        // Only touch the two small strips that actually changed --
+        // erase the old paddle rect, draw the new one -- instead of a
+        // full-screen redraw for a one-key nudge.
+        if (breakoutPaddleX != oldX)
+        {
+            breakoutErasePaddleAt(oldX);
+            breakoutDrawPaddleAt(breakoutPaddleX);
+        }
     }
     else if (key == '5' && !breakoutLaunched)
     {
         breakoutLaunched = true;
+        breakoutEraseMessageArea();
     }
-
-    drawBreakout();
 }
 
 static void breakoutTick()
 {
     if (breakoutGameOver || breakoutGameWon || !breakoutLaunched) return;
+
+    // Erase the ball at its current (about-to-be-old) position first --
+    // this plus drawing it at its new position at the end is normally
+    // ALL that needs to touch the screen on a given frame. That's what
+    // stops the full-screen flash: we're no longer wiping and
+    // redrawing the border/bricks/paddle/HUD every 50ms, just the one
+    // small rect the ball actually occupies.
+    breakoutEraseBallAt(breakoutBallX, breakoutBallY);
 
     breakoutBallX += breakoutBallDX;
     breakoutBallY += breakoutBallDY;
@@ -1543,7 +1456,8 @@ static void breakoutTick()
         breakoutBallDY = -breakoutBallDY;
     }
 
-    // Ball lost
+    // Ball lost -- rare event, full redraw is fine here (resets the
+    // ball, may show the launch prompt or GAME OVER banner).
     if (breakoutBallY > playBottom + 8)
     {
         breakoutLives--;
@@ -1619,305 +1533,295 @@ static void breakoutTick()
                     for (uint8_t cc = 0; cc < BREAKOUT_BRICK_COLS && allGone; cc++)
                         if (breakoutBricks[rr][cc] != 0) allGone = false;
 
-                if (allGone) breakoutGameWon = true;
-
-                drawBreakout();
+                if (allGone)
+                {
+                    // Rare, one-time event -- full redraw to show the
+                    // YOU WIN! banner.
+                    breakoutGameWon = true;
+                    drawBreakout();
+                }
+                else
+                {
+                    // Common case: erase just the one destroyed brick,
+                    // refresh the small HUD text strip (score changed),
+                    // and draw the ball at its new bounced position.
+                    breakoutEraseBrickAt(r, c);
+                    breakoutUpdateHUD();
+                    breakoutDrawBallAt(breakoutBallX, breakoutBallY);
+                }
                 return;
             }
         }
     }
 
-    drawBreakout();
+    // Normal frame, nothing but the ball moved.
+    breakoutDrawBallAt(breakoutBallX, breakoutBallY);
 }
 
 // =====================================================================
-// BLECMD app -- BLE HID keyboard with preset actions
+// WiFi Scanner app
 // =====================================================================
 
-static uint8_t blecmdKeyToHID(char key)
-{
-    if (key >= '1' && key <= '9') return (uint8_t)(key - '1' + 0x1E);
-    if (key == '0') return 0x27;
-    if (key == 'A') return 0x04;
-    if (key == 'B') return 0x05;
-    if (key == 'C') return 0x06;
-    if (key == 'D') return 0x07;
-    if (key == '#') return 0x28;
-    return 0;
-}
-
-static uint8_t charToHIDKey(char c)
-{
-    if (c >= 'a' && c <= 'z') return 0x04 + (c - 'a');
-    if (c >= 'A' && c <= 'Z') return 0x04 + (c - 'A');
-    if (c >= '1' && c <= '9') return 0x1E + (c - '1');
-    if (c == '0') return 0x27;
-    if (c == ' ') return 0x2C;
-    if (c == '\n') return 0x28;
-    if (c == '-') return 0x2D;
-    if (c == '=') return 0x2E;
-    if (c == '[') return 0x2F;
-    if (c == ']') return 0x30;
-    if (c == '\\') return 0x31;
-    if (c == ';') return 0x33;
-    if (c == '\'') return 0x34;
-    if (c == ',') return 0x36;
-    if (c == '.') return 0x37;
-    if (c == '/') return 0x38;
-    if (c == '`') return 0x35;
-    return 0;
-}
-
-static void blecmdExecuteAction(uint8_t index)
-{
-    if (index >= BLECMD_ACTION_COUNT) return;
-    const BleAction &action = bleActions[index];
-
-    switch (action.type)
-    {
-        case BLE_ACT_KEY:
-            bleKeyboardSendKey(action.modifiers, action.keyCode);
-            delay(50);
-            bleKeyboardReleaseKey();
-            break;
-        case BLE_ACT_CONSUMER:
-            bleKeyboardSendConsumer(action.usageCode);
-            delay(50);
-            bleKeyboardReleaseConsumer();
-            break;
-        case BLE_ACT_STRING:
-            blecmdTypeStr = action.str;
-            blecmdTypeIdx = 0;
-            blecmdTyping = true;
-            blecmdTypeReleasePending = false;
-            blecmdTypeLastTime = millis();
-            break;
-    }
-}
-
-static void drawBLECMDRow(uint8_t rowSlot, bool cursorHere)
-{
-    int16_t y = BLECMD_LIST_Y + rowSlot * BLECMD_ROW_H;
-    int16_t rowX = 8;
-    int16_t rowW = SCREEN_WIDTH - 16;
-    int16_t rowH = BLECMD_ROW_H - 2;
-
-    tft->fillRect(rowX, y, rowW, rowH, COLOR_BG);
-
-    uint8_t idx = blecmdScrollTop + rowSlot;
-    if (idx >= BLECMD_ACTION_COUNT) return;
-
-    if (cursorHere)
-    {
-        tft->fillRoundRect(rowX, y, rowW, rowH, 2, COLOR_SELECT_BG);
-        tft->drawRoundRect(rowX, y, rowW, rowH, 2, COLOR_ACCENT_DIM);
-    }
-
-    tft->setTextSize(1);
-    tft->setTextColor(cursorHere ? COLOR_FG : COLOR_DIM);
-    tft->setCursor(rowX + 4, y + (rowH - 8) / 2);
-    tft->print(bleActions[idx].label);
-}
-
-static void drawBLECMDList()
-{
-    for (uint8_t i = 0; i < BLECMD_VISIBLE_ROWS; i++)
-    {
-        uint8_t idx = blecmdScrollTop + i;
-        drawBLECMDRow(i, idx == blecmdCursor);
-    }
-}
-
-void drawBLECMD()
-{
-    clearContent();
-    drawStatusBar();
-
-    tft->setTextSize(1);
-    tft->setTextColor(COLOR_FG);
-    const char* title = "BLE Keyboard";
-    int16_t tx = (SCREEN_WIDTH - (int16_t)strlen(title) * 6) / 2;
-    if (tx < 2) tx = 2;
-    tft->setCursor(tx, CONTENT_TOP + 2);
-    tft->print(title);
-
-    blecmdLastConnected = false;
-    drawBLECMDStatus();
-
-    drawBLECMDList();
-
-    tft->setTextColor(COLOR_DIM);
-    const char* hint = "0=Up #=Dn 5=Send";
-    int16_t hx = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
-    tft->setCursor(hx, SCREEN_HEIGHT - 10);
-    tft->print(hint);
-}
-
-static void drawBLECMDStatus()
+static void drawWifiScannerStatus()
 {
     tft->fillRect(0, CONTENT_TOP + 12, SCREEN_WIDTH, 12, COLOR_BG);
 
     tft->setTextSize(1);
 
-    const char* s = nullptr;
+    char buf[24];
     uint16_t color = COLOR_FG;
 
-    if (blecmdTyping)
+    if (wifiScanIsScanning())
     {
-        s = "Typing...";
-        color = COLOR_ACCENT;
-    }
-    else if (bleKeyboardIsConnected())
-    {
-        s = "Connected";
-        color = COLOR_ACCENT;
-    }
-    else if (bleKeyboardIsActive())
-    {
-        s = "Waiting...";
-        color = COLOR_DIM;
-    }
-
-    if (s)
-    {
-        tft->setTextColor(color);
-        int16_t sx = (SCREEN_WIDTH - (int16_t)strlen(s) * 6) / 2;
-        tft->setCursor(sx, CONTENT_TOP + 14);
-        tft->print(s);
-    }
-
-    blecmdLastConnected = bleKeyboardIsConnected();
-}
-
-static void handleBLECMDKey(char key)
-{
-    if (blecmdTyping) return;
-
-    if (key == KEY_UP)
-    {
-        if (blecmdCursor > 0)
-        {
-            blecmdCursor--;
-            if (blecmdCursor < blecmdScrollTop) blecmdScrollTop = blecmdCursor;
-            drawBLECMDList();
-        }
-    }
-    else if (key == KEY_DOWN)
-    {
-        if (blecmdCursor < BLECMD_ACTION_COUNT - 1)
-        {
-            blecmdCursor++;
-            if (blecmdCursor >= blecmdScrollTop + BLECMD_VISIBLE_ROWS)
-                blecmdScrollTop = blecmdCursor - BLECMD_VISIBLE_ROWS + 1;
-            drawBLECMDList();
-        }
-    }
-    else if (key == KEY_SELECT)
-    {
-        blecmdExecuteAction(blecmdCursor);
-        drawBLECMDStatus();
-    }
-}
-
-// =====================================================================
-// Bluetooth Scanner app
-// =====================================================================
-
-static void drawBTScannerStatus()
-{
-    tft->fillRect(0, CONTENT_TOP + 12, SCREEN_WIDTH, 12, COLOR_BG);
-
-    tft->setTextSize(1);
-
-    const char* s;
-    uint16_t color = COLOR_FG;
-
-    if (btScannerIsConnected())
-    {
-        s = "Connected!";
-        color = COLOR_ACCENT;
-    }
-    else if (btScannerIsScanning())
-    {
-        s = "Scanning...";
+        strncpy(buf, "Scanning...", sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
     }
     else
     {
-        s = "Select device";
+        uint8_t count = wifiScanNetworkCount();
+        snprintf(buf, sizeof(buf), "%u network%s found", count, (count == 1) ? "" : "s");
+        color = COLOR_ACCENT;
     }
 
     tft->setTextColor(color);
-    int16_t sx = (SCREEN_WIDTH - (int16_t)strlen(s) * 6) / 2;
+    int16_t sx = (SCREEN_WIDTH - (int16_t)strlen(buf) * 6) / 2;
+    if (sx < 0) sx = 0;
     tft->setCursor(sx, CONTENT_TOP + 14);
-    tft->print(s);
+    tft->print(buf);
 }
 
-static void drawBTScannerList()
+// Draws the visible page of scanned SSIDs. Any name too wide for its
+// row scrolls as a looping ticker (using the shared wifiMarqueeOffset
+// character position) rather than being truncated, so the full SSID
+// is still readable.
+static void drawWifiScannerList()
 {
-    uint8_t count = btScannerDeviceCount();
+    uint8_t count = wifiScanNetworkCount();
 
-    for (uint8_t i = 0; i < BT_VISIBLE_ROWS; i++)
+    for (uint8_t i = 0; i < WIFI_VISIBLE_ROWS; i++)
     {
-        uint8_t idx = btScrollTop + i;
-        int16_t y = BT_LIST_Y + i * BT_ROW_H;
+        uint8_t idx = wifiScrollTop + i;
+        int16_t y = WIFI_LIST_Y + i * WIFI_ROW_H;
         int16_t rowX = 8;
         int16_t rowW = SCREEN_WIDTH - 16;
-        int16_t rowH = BT_ROW_H - 2;
+        int16_t rowH = WIFI_ROW_H - 2;
 
         tft->fillRect(rowX, y, rowW, rowH, COLOR_BG);
 
         if (idx >= count) continue;
 
-        bool cursorHere = (idx == btCursor);
+        bool cursorHere = (idx == wifiCursor);
 
         if (cursorHere)
         {
-            tft->fillRoundRect(rowX, y, rowW, rowH, 2, COLOR_SELECT_BG);
-            tft->drawRoundRect(rowX, y, rowW, rowH, 2, COLOR_ACCENT_DIM);
+            tft->fillRect(rowX, y, rowW, rowH, COLOR_SELECT_BG);
+            tft->drawRect(rowX, y, rowW, rowH, COLOR_ACCENT_DIM);
         }
 
+        uint16_t rowColor = cursorHere ? COLOR_FG : COLOR_DIM;
         tft->setTextSize(1);
-        tft->setTextColor(cursorHere ? COLOR_FG : COLOR_DIM);
+        tft->setTextColor(rowColor);
 
-        const char* name = btScannerDeviceName(idx);
-        char label[20];
-        strncpy(label, name, 16);
-        label[16] = '\0';
-        int16_t nameW = (int16_t)strlen(label) * 6;
+        // RSSI text, right-aligned within the row.
+        char rssiBuf[6];
+        snprintf(rssiBuf, sizeof(rssiBuf), "%d", wifiScanRSSI(idx));
+        int16_t rssiW = (int16_t)strlen(rssiBuf) * 6;
+        int16_t rssiX = rowX + rowW - 4 - rssiW;
 
-        tft->setCursor(rowX + 4, y + (rowH - 8) / 2);
+        // Small lock glyph just left of the RSSI: filled = secured
+        // network, hollow outline = open network.
+        const int16_t lockSz = 5;
+        int16_t lockX = rssiX - 4 - lockSz;
+        int16_t lockY = y + (rowH - lockSz) / 2;
+        tft->drawRect(lockX, lockY, lockSz, lockSz, rowColor);
+        if (wifiScanIsEncrypted(idx))
+        {
+            tft->fillRect(lockX + 1, lockY + 1, lockSz - 2, lockSz - 2, rowColor);
+        }
+
+        // SSID: fits normally when short enough, otherwise scrolls.
+        int16_t nameAreaX = rowX + 4;
+        int16_t nameAreaW = lockX - 4 - nameAreaX;
+        uint8_t nameSlots = (nameAreaW > 0) ? (uint8_t)(nameAreaW / 6) : 0;
+        if (nameSlots > 22) nameSlots = 22;
+
+        const char* ssid = wifiScanSSID(idx);
+        size_t ssidLen = strlen(ssid);
+        char label[24];
+
+        if (ssidLen <= nameSlots)
+        {
+            strncpy(label, ssid, sizeof(label) - 1);
+            label[sizeof(label) - 1] = '\0';
+        }
+        else
+        {
+            // Circular ticker: the name plus a small gap, repeating --
+            // wifiMarqueeOffset is a shared character position advanced
+            // once per WIFI_MARQUEE_STEP_MS in uiTick() so every
+            // overflowing row scrolls in sync.
+            char ring[40];
+            snprintf(ring, sizeof(ring), "%s   ", ssid);
+            size_t ringLen = strlen(ring);
+            uint16_t off = (ringLen > 0) ? (wifiMarqueeOffset % ringLen) : 0;
+            uint8_t copyLen = (nameSlots < sizeof(label) - 1) ? nameSlots : (uint8_t)(sizeof(label) - 1);
+
+            for (uint8_t c = 0; c < copyLen; c++)
+            {
+                label[c] = ring[(off + c) % ringLen];
+            }
+            label[copyLen] = '\0';
+        }
+
+        tft->setCursor(nameAreaX, y + (rowH - 8) / 2);
         tft->print(label);
 
-        char rssiBuf[8];
-        snprintf(rssiBuf, sizeof(rssiBuf), "%d", btScannerDeviceRSSI(idx));
-        int16_t rssiW = (int16_t)strlen(rssiBuf) * 6;
-        int16_t szX = rowX + rowW - 4 - rssiW;
-        if (szX > rowX + 4 + nameW + 6)
-        {
-            tft->setCursor(szX, y + (rowH - 8) / 2);
-            tft->print(rssiBuf);
-        }
+        tft->setCursor(rssiX, y + (rowH - 8) / 2);
+        tft->print(rssiBuf);
     }
 }
 
-void drawBTScanner()
+void drawWifiScanner()
 {
     clearContent();
     drawStatusBar();
 
     tft->setTextSize(1);
     tft->setTextColor(COLOR_FG);
-    const char* title = "Bluetooth Scanner";
+    const char* title = "WiFi Scanner";
     int16_t tx = (SCREEN_WIDTH - (int16_t)strlen(title) * 6) / 2;
     if (tx < 2) tx = 2;
     tft->setCursor(tx, CONTENT_TOP + 2);
     tft->print(title);
 
-    drawBTScannerStatus();
-    drawBTScannerList();
+    drawWifiScannerStatus();
+    drawWifiScannerList();
 
     tft->setTextColor(COLOR_DIM);
-    const char* hint = "5=Connect *=Back";
+    const char* hint = "5=Rescan *=Back";
+    int16_t hx = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
+    tft->setCursor(hx, SCREEN_HEIGHT - 10);
+    tft->print(hint);
+}
+
+// =====================================================================
+// StockWatch app -- live stock prices via the Finnhub API (see
+// StockWatch.h/.cpp for the WiFi connect + HTTPS fetching; this only
+// reads the sorted results and draws).
+// =====================================================================
+
+static void drawStockWatchStatus()
+{
+    tft->fillRect(0, CONTENT_TOP + 12, SCREEN_WIDTH, 12, COLOR_BG);
+
+    tft->setTextSize(1);
+
+    char buf[28];
+    uint16_t color = COLOR_FG;
+
+    switch (stockWatchGetStatus())
+    {
+        case STOCK_STATUS_CONNECTING_WIFI:
+            strncpy(buf, "Connecting to WiFi...", sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+            break;
+        case STOCK_STATUS_WIFI_FAILED:
+            strncpy(buf, "WiFi connection failed", sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+            color = COLOR_DIM;
+            break;
+        case STOCK_STATUS_FETCHING:
+            strncpy(buf, "Fetching quotes...", sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+            break;
+        case STOCK_STATUS_NO_DATA:
+            strncpy(buf, "No quotes available", sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+            color = COLOR_DIM;
+            break;
+        case STOCK_STATUS_READY:
+        {
+            uint8_t count = stockWatchCount();
+            snprintf(buf, sizeof(buf), "%u quote%s (lowest first)", count, (count == 1) ? "" : "s");
+            color = COLOR_ACCENT;
+            break;
+        }
+        case STOCK_STATUS_IDLE:
+        default:
+            strncpy(buf, "Ready", sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+            break;
+    }
+
+    tft->setTextColor(color);
+    int16_t sx = (SCREEN_WIDTH - (int16_t)strlen(buf) * 6) / 2;
+    if (sx < 0) sx = 0;
+    tft->setCursor(sx, CONTENT_TOP + 14);
+    tft->print(buf);
+}
+
+// Draws the visible page of quotes, sorted ascending by price (lowest
+// first) -- StockWatch.cpp does the sorting, this just reads it off.
+static void drawStockWatchList()
+{
+    uint8_t count = stockWatchCount();
+
+    for (uint8_t i = 0; i < STOCK_VISIBLE_ROWS; i++)
+    {
+        uint8_t idx = stockScrollTop + i;
+        int16_t y = STOCK_LIST_Y + i * STOCK_ROW_H;
+        int16_t rowX = 8;
+        int16_t rowW = SCREEN_WIDTH - 16;
+        int16_t rowH = STOCK_ROW_H - 2;
+
+        tft->fillRect(rowX, y, rowW, rowH, COLOR_BG);
+
+        if (idx >= count) continue;
+
+        bool cursorHere = (idx == stockCursor);
+
+        if (cursorHere)
+        {
+            tft->fillRect(rowX, y, rowW, rowH, COLOR_SELECT_BG);
+            tft->drawRect(rowX, y, rowW, rowH, COLOR_ACCENT_DIM);
+        }
+
+        uint16_t rowColor = cursorHere ? COLOR_FG : COLOR_DIM;
+        tft->setTextSize(1);
+        tft->setTextColor(rowColor);
+
+        // Price, right-aligned, e.g. "$123.45".
+        char priceBuf[16];
+        snprintf(priceBuf, sizeof(priceBuf), "$%.2f", stockWatchPrice(idx));
+        int16_t priceW = (int16_t)strlen(priceBuf) * 6;
+        int16_t priceX = rowX + rowW - 4 - priceW;
+
+        tft->setCursor(rowX + 4, y + (rowH - 8) / 2);
+        tft->print(stockWatchSymbol(idx));
+
+        tft->setCursor(priceX, y + (rowH - 8) / 2);
+        tft->print(priceBuf);
+    }
+}
+
+void drawStockWatch()
+{
+    clearContent();
+    drawStatusBar();
+
+    tft->setTextSize(1);
+    tft->setTextColor(COLOR_FG);
+    const char* title = "StockWatch";
+    int16_t tx = (SCREEN_WIDTH - (int16_t)strlen(title) * 6) / 2;
+    if (tx < 2) tx = 2;
+    tft->setCursor(tx, CONTENT_TOP + 2);
+    tft->print(title);
+
+    drawStockWatchStatus();
+    drawStockWatchList();
+
+    tft->setTextColor(COLOR_DIM);
+    const char* hint = "5=Refresh *=Back";
     int16_t hx = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
     tft->setCursor(hx, SCREEN_HEIGHT - 10);
     tft->print(hint);
@@ -2115,8 +2019,8 @@ static void drawFilesRow(uint8_t rowSlot, bool cursorHere)
 
     if (cursorHere)
     {
-        tft->fillRoundRect(rowX, y, rowW, rowH, 2, COLOR_SELECT_BG);
-        tft->drawRoundRect(rowX, y, rowW, rowH, 2, COLOR_ACCENT_DIM);
+        tft->fillRect(rowX, y, rowW, rowH, COLOR_SELECT_BG);
+        tft->drawRect(rowX, y, rowW, rowH, COLOR_ACCENT_DIM);
     }
 
     char label[24];
@@ -2212,8 +2116,11 @@ static void drawFilesReturn()
 // =====================================================================
 
 // Wraps filePreviewBuffer (already read from SD) into fixed-width lines,
-// honoring explicit newlines, up to FILEVIEW_MAX_LINES.
-static void wrapFileBuffer()
+// honoring explicit newlines, up to FILEVIEW_MAX_LINES. Returns true if
+// the whole buffer was consumed, or false if it had to stop early
+// because FILEVIEW_MAX_LINES was reached first (caller uses this to
+// show an accurate "more below" note instead of silently cutting off).
+static bool wrapFileBuffer()
 {
     fileViewLineCount = 0;
     size_t pos = 0;
@@ -2234,45 +2141,73 @@ static void wrapFileBuffer()
             rawLen--;
         }
 
-        // Word-wrap this raw line into one or more display lines.
-        size_t segStart = 0;
-        do
+        if (rawLen == 0)
         {
-            size_t remaining = rawLen - segStart;
-            size_t take = remaining < (FILEVIEW_LINE_LEN - 1) ? remaining : (FILEVIEW_LINE_LEN - 1);
-
-            if (take < remaining)
-            {
-                size_t breakAt = take;
-                while (breakAt > 0 && filePreviewBuffer[pos + segStart + breakAt] != ' ')
-                {
-                    breakAt--;
-                }
-                if (breakAt > 0) take = breakAt;
-            }
-
-            if (fileViewLineCount >= FILEVIEW_MAX_LINES) break;
-
-            memcpy(fileViewLines[fileViewLineCount], &filePreviewBuffer[pos + segStart], take);
-            fileViewLines[fileViewLineCount][take] = '\0';
-            fileViewLineCount++;
-
-            segStart += take;
-            while (segStart < rawLen && filePreviewBuffer[pos + segStart] == ' ')
-            {
-                segStart++;
-            }
-        } while (segStart < rawLen && fileViewLineCount < FILEVIEW_MAX_LINES);
-
-        if (rawLen == 0 && fileViewLineCount < FILEVIEW_MAX_LINES)
-        {
-            // Preserve blank lines.
+            // Blank source line -> exactly one blank display line.
             fileViewLines[fileViewLineCount][0] = '\0';
             fileViewLineCount++;
         }
+        else
+        {
+            // Word-wrap this raw line into one or more display lines.
+            size_t segStart = 0;
+            while (segStart < rawLen && fileViewLineCount < FILEVIEW_MAX_LINES)
+            {
+                size_t remaining = rawLen - segStart;
+                size_t take = remaining < (FILEVIEW_LINE_LEN - 1) ? remaining : (FILEVIEW_LINE_LEN - 1);
 
-        pos = lineEnd + 1; // skip past the '\n'
+                if (take < remaining)
+                {
+                    size_t breakAt = take;
+                    while (breakAt > 0 && filePreviewBuffer[pos + segStart + breakAt] != ' ')
+                    {
+                        breakAt--;
+                    }
+                    if (breakAt > 0) take = breakAt;
+                }
+
+                memcpy(fileViewLines[fileViewLineCount], &filePreviewBuffer[pos + segStart], take);
+                fileViewLines[fileViewLineCount][take] = '\0';
+                fileViewLineCount++;
+
+                segStart += take;
+                while (segStart < rawLen && filePreviewBuffer[pos + segStart] == ' ')
+                {
+                    segStart++;
+                }
+            }
+        }
+
+        pos = lineEnd + 1; // skip past the '\n' (or past the end, if there wasn't one)
     }
+
+    return pos >= filePreviewLen;
+}
+
+// Cheap heuristic to tell a binary file from text before trying to wrap
+// it: if more than ~15% of a sample of the bytes are NUL/control
+// characters (outside tab/CR/LF), treat it as binary rather than
+// rendering a screen full of garbage glyphs.
+static bool looksBinary(const char* buf, size_t len)
+{
+    if (len == 0) return false;
+
+    size_t sample = (len < 512) ? len : 512;
+    size_t suspicious = 0;
+
+    for (size_t i = 0; i < sample; i++)
+    {
+        uint8_t c = (uint8_t)buf[i];
+        if (c == 0)
+        {
+            suspicious += 4; // a NUL byte is a very strong binary signal
+            continue;
+        }
+        if (c == '\n' || c == '\r' || c == '\t') continue;
+        if (c < 0x20 || c == 0x7F) suspicious++;
+    }
+
+    return (suspicious * 100) > (sample * 15);
 }
 
 // =====================================================================
@@ -2432,11 +2367,29 @@ static void openFilePreview(uint8_t realIdx)
 
     size_t bytesRead = 0;
     bool ok = filesReadPreview(realIdx, filePreviewBuffer, sizeof(filePreviewBuffer), &bytesRead);
-    filePreviewLen = ok ? bytesRead : 0;
+    (void)ok; // bytesRead is authoritative even on a partial/failed read -- see filesReadPreview()
+    filePreviewLen = bytesRead;
 
     filesViewingEntry = realIdx;
     filePreviewLineOffset = 0;
-    wrapFileBuffer();
+
+    filePreviewIsBinary = (filePreviewLen > 0) && looksBinary(filePreviewBuffer, filePreviewLen);
+
+    // The file on the SD card can be bigger than what we read into the
+    // fixed-size preview buffer -- flag that so drawFileView() can say
+    // so plainly instead of the preview just quietly stopping partway
+    // through, which is what used to read as "broken" on larger files.
+    filePreviewBufferTruncated = (fileEntries[realIdx].size > (uint32_t)filePreviewLen);
+
+    if (filePreviewIsBinary)
+    {
+        fileViewLineCount = 0;
+        filePreviewLinesTruncated = false;
+    }
+    else
+    {
+        filePreviewLinesTruncated = !wrapFileBuffer();
+    }
 
     currentState = FILEVIEW;
     drawFileView();
@@ -2460,8 +2413,27 @@ void drawFileView()
     tft->setTextColor(COLOR_FG);
     if (fileViewLineCount == 0)
     {
-        const char* empty = "(empty or unreadable)";
+        // Distinguish *why* there's nothing to show, rather than one
+        // ambiguous catch-all message -- an actually-empty file, a
+        // binary file we deliberately didn't try to render as text, and
+        // a genuine read failure (SD hiccup, file vanished, etc.) are
+        // three different situations and look different to the user.
+        const char* empty;
+        if (filePreviewLen == 0 && fileEntries[filesViewingEntry].size == 0)
+        {
+            empty = "(empty file)";
+        }
+        else if (filePreviewIsBinary)
+        {
+            empty = "(binary file - no preview)";
+        }
+        else
+        {
+            empty = "(could not read file)";
+        }
+
         int16_t ex = (SCREEN_WIDTH - (int16_t)strlen(empty) * 6) / 2;
+        if (ex < 2) ex = 2;
         tft->setCursor(ex, CONTENT_TOP + 30);
         tft->print(empty);
     }
@@ -2475,9 +2447,29 @@ void drawFileView()
             tft->setCursor(6, textY + i * FILEVIEW_LINE_H);
             tft->print(fileViewLines[lineIdx]);
         }
-    }
 
-    
+        // Say plainly when we're only showing part of the file, instead
+        // of the preview silently stopping -- this is the main thing
+        // that used to look broken on files with a lot of content.
+        if (filePreviewBufferTruncated)
+        {
+            char note[36];
+            snprintf(note, sizeof(note), "Showing %lu of %lu bytes",
+                     (unsigned long)filePreviewLen,
+                     (unsigned long)fileEntries[filesViewingEntry].size);
+            tft->setTextColor(COLOR_DIM);
+            tft->setCursor(4, SCREEN_HEIGHT - 9);
+            tft->print(note);
+        }
+        else if (filePreviewLinesTruncated)
+        {
+            char note[36];
+            snprintf(note, sizeof(note), "Showing first %u lines", (unsigned)FILEVIEW_MAX_LINES);
+            tft->setTextColor(COLOR_DIM);
+            tft->setCursor(4, SCREEN_HEIGHT - 9);
+            tft->print(note);
+        }
+    }
 }
 
 // =====================================================================
