@@ -161,11 +161,58 @@ bool filesReadPreview(uint8_t index, char* buffer, size_t bufferSize, size_t* by
         return false;
     }
 
-    size_t toRead = bufferSize - 1;
-    size_t n = f.read((uint8_t*)buffer, toRead);
-    buffer[n] = '\0';
+    // Read in small chunks rather than one single big read() call. A
+    // single large read is far more likely to hit a transient SPI/SD
+    // hiccup on real hardware (breadboard wiring, a slower card, etc.)
+    // than several small ones -- and previously, if that one call
+    // stumbled at all, the WHOLE preview was thrown away, which is what
+    // showed up as "could not read file" specifically on bigger files.
+    // Reading in chunks means a hiccup partway through just stops us
+    // where we are, and whatever was read successfully before that is
+    // still shown instead of being discarded.
+    const size_t CHUNK = 256;
+    size_t total = 0;
+    size_t toRead = bufferSize - 1; // leave room for the NUL terminator
+
+    while (total < toRead)
+    {
+        size_t want = toRead - total;
+        if (want > CHUNK) want = CHUNK;
+
+        size_t n = f.read((uint8_t*)buffer + total, want);
+
+        // Defensive: a well-behaved read() never returns more bytes than
+        // requested. Some SD/Stream implementations report a failed read
+        // by returning a negative int internally, which -- because the
+        // public API's return type is size_t -- would silently become a
+        // huge unsigned value (SIZE_MAX) here instead of a small error
+        // code. Treat any out-of-range count as "this chunk failed"
+        // rather than ever trusting it.
+        if (n > want) n = 0;
+
+        if (n == 0)
+        {
+            // One retry covers a single transient hiccup. If the retry
+            // also comes back empty, stop here and keep whatever total
+            // bytes we already have -- a partial preview beats none.
+            n = f.read((uint8_t*)buffer + total, want);
+            if (n > want) n = 0;
+            if (n == 0) break;
+        }
+
+        total += n;
+
+        if (n < want) break; // short read -- end of file
+    }
+
     f.close();
 
-    if (bytesRead) *bytesRead = n;
-    return true;
+    buffer[total] = '\0';
+
+    if (bytesRead) *bytesRead = total;
+
+    // Only report outright failure when we truly got nothing back from
+    // a non-empty file. Any partial content read successfully is still
+    // worth showing.
+    return (total > 0) || (fileEntries[index].size == 0);
 }
