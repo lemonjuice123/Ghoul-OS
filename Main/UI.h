@@ -1,3 +1,6 @@
+//====================================================================
+// UI.h – UI state machine and function prototypes for Ghoul OS.
+//====================================================================
 #ifndef UI_H
 #define UI_H
 
@@ -6,28 +9,23 @@
 #include <Adafruit_ST7735.h>
 #include "Apps.h"
 
-// =====================================================================
-// Ghoul OS - UI.h
-//
-// The whole UI is a small state machine (BOOT -> MENU -> APP -> MENU...)
-// driven by uiHandleKey() for input and uiTick() for animation/timing.
-// =====================================================================
-
-enum UIState
-{
+// ---------------------------------------------------------------------------
+// UI states.
+// ---------------------------------------------------------------------------
+enum UIState {
     BOOT,
     MENU,
     APP,
     KEYTEST,    // "Key Test" app: live keypad press visualizer
     SETTINGS,   // "Settings" app: audio feedback on/off toggle
     FILES,      // "Files" app: SD card directory listing
-    FILEVIEW,   // "Files" app: simple text preview of a selected file
+    FILEVIEW,  // "Files" app: simple text preview of a selected file
     MINIPIANO,  // "MiniPiano" app: 9-key mini piano
-    BLECMD,     // "BLECMD" app: BLE HID keyboard
     BREAKOUT,   // "Games" app: breakout
-    BTSCANNER,  // "Bluetooth" app: BLE device scanner
     BMPVIEW,    // "Files" app: BMP image viewer
-    PACKETMON   // "PackMon" app: live 802.11 packet-rate graph
+    PACKETMON,  // "PackMon" app: live 802.11 packet-rate graph
+    WIFISCAN,   // "WiFi Scanner" app: nearby SSID scanner
+    STOCKWATCH  // "StockWatch" app: live stock prices via Finnhub
 };
 
 extern UIState currentState;
@@ -54,10 +52,10 @@ void drawSettings();
 void drawFiles();
 void drawFileView();
 void drawMiniPiano();
-void drawBLECMD();
 void drawBreakout();
-void drawBTScanner();
 void drawPacketMon();
+void drawWifiScanner();
+void drawStockWatch();
 void clearContent();
 
 #endif // UI_H
