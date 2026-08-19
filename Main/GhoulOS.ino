@@ -45,7 +45,6 @@
 #include "UI.h"
 #include "FileBrowser.h"
 #include "Audio.h"
-#include "BLEKeyboard.h"
 
 // ------------------------------------------------------------------
 // Hardware instances
