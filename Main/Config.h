@@ -170,12 +170,12 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 // only ever passively scans and never associates to a network, while
 // StockWatch needs a real internet connection to reach Finnhub.
 // >>> Fill these in with your real network's SSID/password. <<<
-#define STOCK_WIFI_SSID     "AKKU_2.4G"
-#define STOCK_WIFI_PASSWORD "akku@2023"
+#define STOCK_WIFI_SSID     "wifissid"
+#define STOCK_WIFI_PASSWORD "wifipassword"
 
 // Finnhub API key -- create a free one at https://finnhub.io/register
 // >>> Fill this in with your real Finnhub API key. <<<
-#define FINNHUB_API_KEY "da1usihr01qp0a25tvcgda1usihr01qp0a25tvd0"
+#define FINNHUB_API_KEY "finnhub api key here"
 
 // The list of ticker symbols tracked is in StockWatch.cpp
 // (stockSymbols[]) -- edit that array to change which companies show up
