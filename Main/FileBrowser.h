@@ -14,7 +14,10 @@
 #define FB_MAX_ENTRIES      40   // entries listed per directory
 #define FB_MAX_NAME_LEN     32
 #define FB_MAX_PATH_LEN     128
-#define FB_PREVIEW_BUF_SIZE 512  // bytes read when previewing a file
+// Bytes read when previewing a file. Text files up to this size are
+// shown in full; larger files are truncated with a clear on-screen
+// note (see UI.cpp's drawFileView()) rather than silently cutting off.
+#define FB_PREVIEW_BUF_SIZE 8192
 
 struct FileEntry
 {
