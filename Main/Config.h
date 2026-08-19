@@ -43,49 +43,50 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 #define KEY_BACK   '*'
 
 // ------------------------------ TIMING ---------------------------------
-#define BOOT_SPLASH_DURATION_MS 2000UL
+#define BOOT_SPLASH_DURATION_MS 3000UL
 #define FRAME_INTERVAL_MS       33UL   // ~30 FPS
 #define ANIM_DURATION_MS        220UL  // carousel slide duration
 
 // ------------------------------ COLORS (RGB565) -------------------------
+// Retro CRT / terminal theme: monochrome phosphor green on black,
+// inspired by old amber/green terminal readouts (see e.g. the classic
+// "REGISTER CONTROL" synth-tracker screens) and the Pip-Boy's green
+// display. Every screen in the UI draws through these macros rather
+// than hardcoded hex, so changing the theme here re-themes the whole
+// device -- no blue/cyan/white left anywhere.
 #define COLOR_BG         0x0000  // Black
-#define COLOR_FG         0xFFFF  // White
-#define COLOR_ACCENT     0x07FF  // Cyan accent
-#define COLOR_ACCENT_DIM 0x0451  // Dark teal
-#define COLOR_DIM        0x39C7  // Dim gray
-#define COLOR_STATUSBAR  0x18C3  // Dark slate
-#define COLOR_SELECT_BG  0x0AB1  // Deep teal (selection highlight)
+#define COLOR_FG         0x3FED  // Bright phosphor green -- normal text
+#define COLOR_ACCENT     0xBFF7  // Near-white mint green -- headers/selected text/emphasis
+#define COLOR_ACCENT_DIM 0x1468  // Mid green -- borders, dividers
+#define COLOR_DIM        0x1366  // Dark green -- secondary/hint text
+#define COLOR_STATUSBAR  0x00C1  // Near-black green -- status bar strip
+#define COLOR_SELECT_BG  0x01E3  // Dark green fill -- selection highlight background
 
 // ------------------------------ LAYOUT -----------------------------------
 #define STATUSBAR_HEIGHT 14
 #define CONTENT_TOP      (STATUSBAR_HEIGHT)
 #define CONTENT_HEIGHT   (SCREEN_HEIGHT - STATUSBAR_HEIGHT)
 
-#define LEFT_PANEL_X      4
-#define LEFT_PANEL_W      92
-#define RIGHT_PANEL_X     (LEFT_PANEL_X + LEFT_PANEL_W + 2)
-#define RIGHT_PANEL_W     (SCREEN_WIDTH - RIGHT_PANEL_X - 2)
+// The launcher is now a single centered text carousel spanning nearly
+// the full screen width -- no more icon/description side panel.
+#define RIGHT_PANEL_X     6
+#define RIGHT_PANEL_W     (SCREEN_WIDTH - RIGHT_PANEL_X - 4)
 
-#define CAROUSEL_ITEM_H        18
+// Bigger row height to fit the larger (size-2) carousel text.
+#define CAROUSEL_ITEM_H        22
 #define CAROUSEL_VISIBLE_ITEMS 5
 
 // Vertical scrollbar drawn along the rightmost edge of the screen,
-// showing progress through the app list.
-#define SCROLLBAR_WIDTH 3
+// showing progress through the app list -- drawn as a solid rectangle
+// block, not a rounded pill, to match the rest of the theme.
+#define SCROLLBAR_WIDTH 4
 #define SCROLLBAR_GAP   3
 
-// Large icon on the left panel is now as wide as the info/description
-// box directly below it (LEFT_PANEL_W), so the two bordered elements
-// line up edge-to-edge.
-#define LARGE_ICON_W        LEFT_PANEL_W
-#define LARGE_ICON_H        48
 #define STATUSBAR_ICON_SIZE 10
-#define APP_SCREEN_ICON_SIZE 56
 
-// Shared border style used for both the big app icon placeholder and
-// the description info box, so they read as one consistent UI element.
-#define ICON_BORDER_COLOR  0x249F  // a clean "dodger" blue
-#define ICON_BORDER_RADIUS 4
+// Shared border color for bordered panels (app placeholder screens,
+// the PackMon graph, etc.) so they all read as one consistent theme.
+#define ICON_BORDER_COLOR  COLOR_ACCENT_DIM
 
 // ---------------------------- SD CARD ---------------------------------
 // SD_CS  -> GPIO4    (dedicated chip-select)
@@ -154,17 +155,34 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 #define BREAKOUT_BRICK_H     5
 #define BREAKOUT_BRICK_GAP   1
 
-// ---------------------------- BLECMD APP LAYOUT ----------------------------
-#define BLECMD_LIST_Y       (CONTENT_TOP + 24)
-#define BLECMD_ROW_H        11
-#define BLECMD_VISIBLE_ROWS 7
+// ---------------------------- WIFI SCANNER APP LAYOUT ----------------------------
+// Scrollable list of nearby SSIDs shown by the "WiFi Scanner" app. SSIDs
+// too long to fit their row scroll horizontally (a marquee/ticker) so
+// the full name is still readable rather than being cut off.
+#define WIFI_LIST_Y          (CONTENT_TOP + 24)
+#define WIFI_ROW_H           12
+#define WIFI_VISIBLE_ROWS    7
+#define WIFI_MARQUEE_STEP_MS 120UL  // ms between each 1-character marquee step
 
-// ---------------------------- BT SCANNER APP LAYOUT ----------------------------
-#define BT_LIST_Y           (CONTENT_TOP + 24)
-#define BT_ROW_H            12
-#define BT_VISIBLE_ROWS     7
-#define BT_MAX_DEVICES      10
-#define BT_NAME_LEN         17
+// ---------------------------- STOCKWATCH APP ----------------------------
+// WiFi credentials used to reach the internet for stock quotes. This is
+// a SEPARATE connection from the WiFi Scanner app above -- WiFi Scanner
+// only ever passively scans and never associates to a network, while
+// StockWatch needs a real internet connection to reach Finnhub.
+// >>> Fill these in with your real network's SSID/password. <<<
+#define STOCK_WIFI_SSID     "AKKU_2.4G"
+#define STOCK_WIFI_PASSWORD "akku@2023"
+
+// Finnhub API key -- create a free one at https://finnhub.io/register
+// >>> Fill this in with your real Finnhub API key. <<<
+#define FINNHUB_API_KEY "da1usihr01qp0a25tvcgda1usihr01qp0a25tvd0"
+
+// The list of ticker symbols tracked is in StockWatch.cpp
+// (stockSymbols[]) -- edit that array to change which companies show up
+// here, not this file.
+#define STOCK_LIST_Y      (CONTENT_TOP + 24)
+#define STOCK_ROW_H        12
+#define STOCK_VISIBLE_ROWS 7
 
 // ---------------------------- PACKMON APP LAYOUT ----------------------------
 // "PackMon": a live 802.11 packet-rate graph, inspired by
