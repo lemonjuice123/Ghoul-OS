@@ -155,6 +155,19 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 #define BREAKOUT_BRICK_H     5
 #define BREAKOUT_BRICK_GAP   1
 
+// ---------------------------- CALCULATOR APP LAYOUT ----------------------------
+#define CALC_MAX_DIGITS 10                 // max digits accepted per operand
+#define CALC_LINE_Y     (CONTENT_TOP + 14) // first text line's y
+#define CALC_LINE_H     14                 // vertical spacing between lines
+
+// ---------------------------- MATRIX APP LAYOUT ----------------------------
+// Full-screen digital-rain screensaver -- like the boot splash, it draws
+// over the whole panel with no status bar. One column per 6px-wide text
+// glyph, one row per 8px-tall glyph, covering the entire screen.
+#define MATRIX_COLS    (SCREEN_WIDTH / 6)
+#define MATRIX_ROWS    (SCREEN_HEIGHT / 8)
+#define MATRIX_TICK_MS 60UL
+
 // ---------------------------- WIFI SCANNER APP LAYOUT ----------------------------
 // Scrollable list of nearby SSIDs shown by the "WiFi Scanner" app. SSIDs
 // too long to fit their row scroll horizontally (a marquee/ticker) so
@@ -171,11 +184,10 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 // StockWatch needs a real internet connection to reach Finnhub.
 // >>> Fill these in with your real network's SSID/password. <<<
 #define STOCK_WIFI_SSID     "wifissid"
-#define STOCK_WIFI_PASSWORD "wifipassword"
+#define STOCK_WIFI_PASSWORD "wifipass"
 
 // Finnhub API key -- create a free one at https://finnhub.io/register
 // >>> Fill this in with your real Finnhub API key. <<<
-#define FINNHUB_API_KEY "finnhub api key here"
 
 // The list of ticker symbols tracked is in StockWatch.cpp
 // (stockSymbols[]) -- edit that array to change which companies show up
@@ -208,5 +220,10 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 // bitmap data is added to an icon array, flip this to 1 to enable the
 // real pixel blit performed by drawBitmapIcon().
 #define ICONS_HAVE_DATA 1
+
+
+// Finnhub API key -- create a free one at https://finnhub.io/register
+// >>> Fill this in with your real Finnhub API key. <<<
+#define FINNHUB_API_KEY "apokeiadoiapikeylarp0"
 
 #endif // CONFIG_H
