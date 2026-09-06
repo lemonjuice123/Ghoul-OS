@@ -18,6 +18,8 @@ void launchSettings()   {}
 void launchFiles()      {}
 void launchMiniPiano()  {}
 void launchKeyTest()    {}
+void launchCalculator() {}
+void launchMatrix()     {}
 
 // --------------------------------------------------------------------------
 // App table – each entry provides name, description, optional icon, and launch.
@@ -31,6 +33,8 @@ const App appList[] = {
     { "Key Test",     "See each keypad press live",      iconKeyTest,   launchKeyTest     },
     { "Settings",     "Toggle audio feedback on/off",    iconSettings,  launchSettings    },
     { "Games",        "Launch built-in mini games",      iconGames,     launchGames       },
+    { "Calculator",   "Digit-entry calculator",          iconGames,     launchCalculator  },
+    { "Matrix",       "Digital rain screensaver",        iconGames,     launchMatrix      },
     { "About",        "Device and firmware information", iconAbout,     launchAbout       }
 };
 
