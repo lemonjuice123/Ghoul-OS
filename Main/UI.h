@@ -25,7 +25,10 @@ enum UIState {
     BMPVIEW,    // "Files" app: BMP image viewer
     PACKETMON,  // "PackMon" app: live 802.11 packet-rate graph
     WIFISCAN,   // "WiFi Scanner" app: nearby SSID scanner
-    STOCKWATCH  // "StockWatch" app: live stock prices via Finnhub
+    STOCKWATCH, // "StockWatch" app: live stock prices via Finnhub
+    CALCULATOR, // "Calculator" app: digit-entry calculator with a menu of operations
+    MATRIX,     // "Matrix" app: full-screen digital-rain screensaver
+    GAME2048    // "2048" app: slide-and-merge number tile game
 };
 
 extern UIState currentState;
@@ -56,6 +59,9 @@ void drawBreakout();
 void drawPacketMon();
 void drawWifiScanner();
 void drawStockWatch();
+void drawCalculator();
+void drawMatrix();
+void drawGame2048();
 void clearContent();
 
 #endif // UI_H
