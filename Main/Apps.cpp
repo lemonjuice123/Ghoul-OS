@@ -20,6 +20,7 @@ void launchMiniPiano()  {}
 void launchKeyTest()    {}
 void launchCalculator() {}
 void launchMatrix()     {}
+void launch2048()       {}
 
 // --------------------------------------------------------------------------
 // App table – each entry provides name, description, optional icon, and launch.
@@ -35,6 +36,7 @@ const App appList[] = {
     { "Games",        "Launch built-in mini games",      iconGames,     launchGames       },
     { "Calculator",   "Digit-entry calculator",          iconGames,     launchCalculator  },
     { "Matrix",       "Digital rain screensaver",        iconGames,     launchMatrix      },
+    { "2048",         "Slide and merge number tiles",    iconGames,     launch2048        },
     { "About",        "Device and firmware information", iconAbout,     launchAbout       }
 };
 
