@@ -1,4 +1,5 @@
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <SD.h>
@@ -111,6 +112,72 @@ static uint16_t wifiMarqueeOffset = 0; // shared ticker position for overflowing
 static uint8_t stockCursor = 0;
 static uint8_t stockScrollTop = 0;
 
+// ----------------------------- Calculator state -----------------------------
+enum CalcStage {
+    CALC_STAGE_NUM1,
+    CALC_STAGE_NUM2,
+    CALC_STAGE_OP,
+    CALC_STAGE_RESULT
+};
+
+static CalcStage calcStage = CALC_STAGE_NUM1;
+static char calcNum1Buf[CALC_MAX_DIGITS + 1] = "";
+static char calcNum2Buf[CALC_MAX_DIGITS + 1] = "";
+static uint8_t calcNum1Len = 0;
+static uint8_t calcNum2Len = 0;
+static uint8_t calcOpIndex = 0;
+static double calcResult = 0.0;
+static bool calcHasError = false;
+static char calcErrorMsg[28] = "";
+
+// ----------------------------- Matrix state -----------------------------
+struct MatrixColumn {
+    int16_t headRow;      // current head row (can be negative = not yet on screen)
+    uint8_t trailLen;     // how many rows behind the head stay lit before going blank
+    uint8_t speedDiv;     // this column advances once every speedDiv ticks
+    uint8_t speedCounter;
+};
+static MatrixColumn matrixCols[MATRIX_COLS];
+static const char matrixChars[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%&*+-/=<>?";
+
+// ----------------------------- 2048 state -----------------------------
+// Tile values are stored as uint32_t (not uint16_t) purely so there is
+// zero risk of overflow even if play went absurdly far beyond what a
+// 4x4 board can realistically reach.
+static uint32_t g2048Grid[G2048_SIZE][G2048_SIZE];
+static uint32_t g2048Score = 0;
+static bool g2048GameOver = false;
+
+// RGB565 tile colors, indexed by "level" = log2(value) - 1 (tile value 2
+// is level 0). Levels 0-1 echo the original game's light neutral early
+// tiles; levels 2-19 are an evenly spaced color-wheel sweep so every
+// higher tile is clearly, distinctly colored rather than just fading to
+// grey -- this is a deliberate departure from the rest of the UI's
+// green monochrome theme, specifically for this app, as asked.
+static const uint16_t g2048TileColors[] = {
+    0xEF3B, // level  0 -- tile        2
+    0xEF19, // level  1 -- tile        4
+    0xE945, // level  2 -- tile        8
+    0xEB45, // level  3 -- tile       16
+    0xED65, // level  4 -- tile       32
+    0xEF65, // level  5 -- tile       64
+    0xAF65, // level  6 -- tile      128
+    0x6F65, // level  7 -- tile      256
+    0x2F65, // level  8 -- tile      512
+    0x2F6D, // level  9 -- tile     1024
+    0x2F75, // level 10 -- tile     2048
+    0x2F7D, // level 11 -- tile     4096
+    0x2D7D, // level 12 -- tile     8192
+    0x2B5D, // level 13 -- tile    16384
+    0x295D, // level 14 -- tile    32768
+    0x695D, // level 15 -- tile    65536
+    0xA95D, // level 16 -- tile   131072
+    0xE95D, // level 17 -- tile   262144
+    0xE955, // level 18 -- tile   524288
+    0xE94D, // level 19 -- tile  1048576
+};
+#define G2048_COLOR_COUNT (sizeof(g2048TileColors) / sizeof(g2048TileColors[0]))
+
 // Forward declarations for internal helpers (not part of the public UI.h API)
 static void drawScrollbar();
 static void startCarouselAnimation();
@@ -144,6 +211,18 @@ static void drawWifiScannerStatus();
 static void drawWifiScannerList();
 static void drawStockWatchStatus();
 static void drawStockWatchList();
+static void calculatorInit();
+static void calculatorHandleKey(char key);
+static void calculatorCompute();
+static void calculatorFormatResult(char* out, size_t outSize);
+static void matrixTick();
+static void g2048Init();
+static void g2048HandleKey(char key);
+static bool g2048Move(char direction);
+static bool g2048SlideLine(uint32_t* line, uint8_t len, uint32_t* scoreDelta);
+static void g2048SpawnTile();
+static bool g2048HasMoves();
+static uint8_t g2048TileLevel(uint32_t value);
 
 // =====================================================================
 // Lifecycle
@@ -245,6 +324,23 @@ void uiHandleKey(char key)
                 stockWatchRefresh();        // blocking: WiFi connect + HTTPS fetches
                 drawStockWatchStatus();
                 drawStockWatchList();
+            }
+            else if (appList[currentAppIndex].launch == launchCalculator)
+            {
+                currentState = CALCULATOR;
+                calculatorInit();
+                drawCalculator();
+            }
+            else if (appList[currentAppIndex].launch == launchMatrix)
+            {
+                currentState = MATRIX;
+                drawMatrix();
+            }
+            else if (appList[currentAppIndex].launch == launch2048)
+            {
+                currentState = GAME2048;
+                g2048Init();
+                drawGame2048();
             }
             else
             {
@@ -423,6 +519,37 @@ void uiHandleKey(char key)
             stockWatchRefresh();
             drawStockWatchStatus();
             drawStockWatchList();
+        }
+    }
+    else if (currentState == CALCULATOR)
+    {
+        if (key == KEY_BACK)
+        {
+            currentState = MENU;
+            drawMenu(true);
+        }
+        else
+        {
+            calculatorHandleKey(key);
+        }
+    }
+    else if (currentState == MATRIX)
+    {
+        // Any key dismisses it -- this is a screensaver, not an app with
+        // its own controls.
+        currentState = MENU;
+        drawMenu(true);
+    }
+    else if (currentState == GAME2048)
+    {
+        if (key == KEY_BACK)
+        {
+            currentState = MENU;
+            drawMenu(true);
+        }
+        else
+        {
+            g2048HandleKey(key);
         }
     }
     else if (currentState == FILES)
@@ -616,6 +743,15 @@ void uiTick()
             drawWifiScannerList();
         }
     }
+    else if (currentState == MATRIX)
+    {
+        static unsigned long lastMatrixTick = 0;
+        if (now - lastMatrixTick >= MATRIX_TICK_MS)
+        {
+            lastMatrixTick = now;
+            matrixTick();
+        }
+    }
 }
 
 // =====================================================================
@@ -629,6 +765,350 @@ void drawBoot()
     // SCREEN_HEIGHT, 20480 entries). Shown for BOOT_SPLASH_DURATION_MS
     // (see Config.h) before uiTick() switches over to MENU.
     drawBitmapIcon(0, 0, bootLogo, SCREEN_WIDTH, SCREEN_HEIGHT);
+}
+
+// =====================================================================
+// Matrix -- full-screen digital-rain screensaver. Like the boot splash,
+// it owns the whole panel with no status bar. Each column falls
+// independently at its own (randomized) speed and trail length so they
+// never sync up, and any key press exits back to the menu.
+// =====================================================================
+
+void drawMatrix()
+{
+    tft->fillScreen(COLOR_BG);
+    tft->setTextSize(1); // guarantee 6x8 glyph cells regardless of what a previous screen left set
+
+    for (uint8_t c = 0; c < MATRIX_COLS; c++)
+    {
+        matrixCols[c].headRow      = -(int16_t)random(1, MATRIX_ROWS * 2);
+        matrixCols[c].trailLen     = 4 + random(6); // 4-9 rows
+        matrixCols[c].speedDiv     = 1 + random(3); // 1-3
+        matrixCols[c].speedCounter = 0;
+    }
+}
+
+static void matrixTick()
+{
+    for (uint8_t c = 0; c < MATRIX_COLS; c++)
+    {
+        MatrixColumn& col = matrixCols[c];
+
+        col.speedCounter++;
+        if (col.speedCounter < col.speedDiv) continue;
+        col.speedCounter = 0;
+
+        int16_t x = c * 6;
+
+        // Erase the row now falling off the tail.
+        int16_t tailRow = col.headRow - col.trailLen;
+        if (tailRow >= 0 && tailRow < MATRIX_ROWS)
+        {
+            tft->fillRect(x, tailRow * 8, 6, 8, COLOR_BG);
+        }
+
+        // Downgrade what was the bright head last tick to the dimmer
+        // trail color (with a freshly-picked character -- a bit of
+        // flicker in the trail reads as more "alive" than a static one).
+        int16_t prevRow = col.headRow - 1;
+        if (prevRow >= 0 && prevRow < MATRIX_ROWS)
+        {
+            tft->fillRect(x, prevRow * 8, 6, 8, COLOR_BG);
+            tft->setTextColor(COLOR_FG);
+            tft->setCursor(x, prevRow * 8);
+            tft->print(matrixChars[random(sizeof(matrixChars) - 1)]);
+        }
+
+        // Draw the new bright head.
+        if (col.headRow >= 0 && col.headRow < MATRIX_ROWS)
+        {
+            tft->fillRect(x, col.headRow * 8, 6, 8, COLOR_BG);
+            tft->setTextColor(COLOR_ACCENT);
+            tft->setCursor(x, col.headRow * 8);
+            tft->print(matrixChars[random(sizeof(matrixChars) - 1)]);
+        }
+
+        col.headRow++;
+
+        // Once even the tail has scrolled past the bottom, restart this
+        // column from a random negative delay so columns stay out of sync.
+        if (col.headRow - col.trailLen >= MATRIX_ROWS)
+        {
+            col.headRow  = -(int16_t)random(1, MATRIX_ROWS * 2);
+            col.trailLen = 4 + random(6);
+            col.speedDiv = 1 + random(3);
+        }
+    }
+}
+
+// =====================================================================
+// 2048 -- slide-and-merge number tile game.
+//
+// Controls: 2/8/4/6 slide the board up/down/left/right (the same
+// direction mapping used elsewhere), 5 starts a new game once the
+// current one has ended. * always exits.
+// =====================================================================
+
+static uint8_t g2048TileLevel(uint32_t value)
+{
+    uint8_t level = 0;
+    uint32_t v = value;
+    while (v > 2)
+    {
+        v >>= 1;
+        level++;
+    }
+    if (level >= G2048_COLOR_COUNT) level = (uint8_t)(G2048_COLOR_COUNT - 1);
+    return level;
+}
+
+static void g2048SpawnTile()
+{
+    uint8_t emptyR[G2048_SIZE * G2048_SIZE];
+    uint8_t emptyC[G2048_SIZE * G2048_SIZE];
+    uint8_t emptyCount = 0;
+
+    for (uint8_t r = 0; r < G2048_SIZE; r++)
+    {
+        for (uint8_t c = 0; c < G2048_SIZE; c++)
+        {
+            if (g2048Grid[r][c] == 0)
+            {
+                emptyR[emptyCount] = r;
+                emptyC[emptyCount] = c;
+                emptyCount++;
+            }
+        }
+    }
+
+    if (emptyCount == 0) return; // board is full -- nothing to spawn
+
+    uint8_t pick = (uint8_t)random(emptyCount);
+    uint32_t value = (random(10) < 9) ? 2 : 4; // classic 2048 odds: 90% a 2, 10% a 4
+    g2048Grid[emptyR[pick]][emptyC[pick]] = value;
+}
+
+static bool g2048HasMoves()
+{
+    for (uint8_t r = 0; r < G2048_SIZE; r++)
+    {
+        for (uint8_t c = 0; c < G2048_SIZE; c++)
+        {
+            if (g2048Grid[r][c] == 0) return true;
+            if (c + 1 < G2048_SIZE && g2048Grid[r][c] == g2048Grid[r][c + 1]) return true;
+            if (r + 1 < G2048_SIZE && g2048Grid[r][c] == g2048Grid[r + 1][c]) return true;
+        }
+    }
+    return false;
+}
+
+static void g2048Init()
+{
+    for (uint8_t r = 0; r < G2048_SIZE; r++)
+    {
+        for (uint8_t c = 0; c < G2048_SIZE; c++)
+        {
+            g2048Grid[r][c] = 0;
+        }
+    }
+
+    g2048Score = 0;
+    g2048GameOver = false;
+
+    g2048SpawnTile();
+    g2048SpawnTile();
+}
+
+// Slides len values toward index 0 (the caller is responsible for
+// presenting the line in "direction of movement = toward index 0"
+// order, reversing first if needed), merging equal adjacent values
+// once each -- a tile that was just created by a merge can't merge
+// again in the same move, which is standard 2048 behavior. Returns
+// true if the line's contents actually changed.
+static bool g2048SlideLine(uint32_t* line, uint8_t len, uint32_t* scoreDelta)
+{
+    uint32_t original[G2048_SIZE];
+    for (uint8_t i = 0; i < len; i++) original[i] = line[i];
+
+    uint32_t compacted[G2048_SIZE] = {0};
+    uint8_t writeIdx = 0;
+    for (uint8_t i = 0; i < len; i++)
+    {
+        if (line[i] != 0)
+        {
+            compacted[writeIdx++] = line[i];
+        }
+    }
+
+    for (uint8_t i = 0; i + 1 < len; i++)
+    {
+        if (compacted[i] != 0 && compacted[i] == compacted[i + 1])
+        {
+            compacted[i] *= 2;
+            *scoreDelta += compacted[i];
+            compacted[i + 1] = 0;
+            i++; // the tile we just merged into is now off-limits this move
+        }
+    }
+
+    uint32_t result[G2048_SIZE] = {0};
+    writeIdx = 0;
+    for (uint8_t i = 0; i < len; i++)
+    {
+        if (compacted[i] != 0)
+        {
+            result[writeIdx++] = compacted[i];
+        }
+    }
+
+    bool changed = false;
+    for (uint8_t i = 0; i < len; i++)
+    {
+        if (result[i] != original[i]) changed = true;
+        line[i] = result[i];
+    }
+    return changed;
+}
+
+// direction: 'U'/'D'/'L'/'R'. Extracts each row or column in the order
+// that direction moves toward (reversing when necessary), slides it,
+// then writes it back in the same order it was read.
+static bool g2048Move(char direction)
+{
+    bool anyChanged = false;
+    uint32_t scoreDelta = 0;
+
+    if (direction == 'L' || direction == 'R')
+    {
+        for (uint8_t r = 0; r < G2048_SIZE; r++)
+        {
+            uint32_t line[G2048_SIZE];
+            for (uint8_t c = 0; c < G2048_SIZE; c++)
+            {
+                uint8_t srcC = (direction == 'L') ? c : (uint8_t)(G2048_SIZE - 1 - c);
+                line[c] = g2048Grid[r][srcC];
+            }
+
+            if (g2048SlideLine(line, G2048_SIZE, &scoreDelta)) anyChanged = true;
+
+            for (uint8_t c = 0; c < G2048_SIZE; c++)
+            {
+                uint8_t dstC = (direction == 'L') ? c : (uint8_t)(G2048_SIZE - 1 - c);
+                g2048Grid[r][dstC] = line[c];
+            }
+        }
+    }
+    else // 'U' or 'D'
+    {
+        for (uint8_t c = 0; c < G2048_SIZE; c++)
+        {
+            uint32_t line[G2048_SIZE];
+            for (uint8_t r = 0; r < G2048_SIZE; r++)
+            {
+                uint8_t srcR = (direction == 'U') ? r : (uint8_t)(G2048_SIZE - 1 - r);
+                line[r] = g2048Grid[srcR][c];
+            }
+
+            if (g2048SlideLine(line, G2048_SIZE, &scoreDelta)) anyChanged = true;
+
+            for (uint8_t r = 0; r < G2048_SIZE; r++)
+            {
+                uint8_t dstR = (direction == 'U') ? r : (uint8_t)(G2048_SIZE - 1 - r);
+                g2048Grid[dstR][c] = line[r];
+            }
+        }
+    }
+
+    g2048Score += scoreDelta;
+    return anyChanged;
+}
+
+static void g2048HandleKey(char key)
+{
+    if (g2048GameOver)
+    {
+        if (key == KEY_SELECT)
+        {
+            g2048Init();
+            drawGame2048();
+        }
+        return;
+    }
+
+    char direction = 0;
+    if (key == '2') direction = 'U';
+    else if (key == '8') direction = 'D';
+    else if (key == '4') direction = 'L';
+    else if (key == '6') direction = 'R';
+    else return; // ignore any other key
+
+    if (g2048Move(direction))
+    {
+        g2048SpawnTile();
+        if (!g2048HasMoves())
+        {
+            g2048GameOver = true;
+        }
+    }
+
+    drawGame2048();
+}
+
+void drawGame2048()
+{
+    clearContent();
+    drawStatusBar();
+
+    tft->setTextSize(1);
+    char header[28];
+    if (g2048GameOver)
+    {
+        snprintf(header, sizeof(header), "GAME OVER  Score:%lu", (unsigned long)g2048Score);
+        tft->setTextColor(COLOR_ACCENT);
+    }
+    else
+    {
+        snprintf(header, sizeof(header), "2048   Score:%lu", (unsigned long)g2048Score);
+        tft->setTextColor(COLOR_FG);
+    }
+    int16_t hx = (SCREEN_WIDTH - (int16_t)strlen(header) * 6) / 2;
+    if (hx < 2) hx = 2;
+    tft->setCursor(hx, CONTENT_TOP + 2);
+    tft->print(header);
+
+    for (uint8_t r = 0; r < G2048_SIZE; r++)
+    {
+        for (uint8_t c = 0; c < G2048_SIZE; c++)
+        {
+            int16_t cx = G2048_GRID_X + c * (G2048_CELL + G2048_GAP);
+            int16_t cy = G2048_GRID_Y + r * (G2048_CELL + G2048_GAP);
+            uint32_t value = g2048Grid[r][c];
+
+            if (value == 0)
+            {
+                tft->fillRect(cx, cy, G2048_CELL, G2048_CELL, COLOR_ACCENT_DIM);
+                tft->drawRect(cx, cy, G2048_CELL, G2048_CELL, COLOR_DIM);
+                continue;
+            }
+
+            uint8_t level = g2048TileLevel(value);
+            tft->fillRect(cx, cy, G2048_CELL, G2048_CELL, g2048TileColors[level]);
+            tft->drawRect(cx, cy, G2048_CELL, G2048_CELL, COLOR_BG);
+
+            char label[8];
+            snprintf(label, sizeof(label), "%lu", (unsigned long)value);
+            uint8_t textLen = (uint8_t)strlen(label);
+            int16_t tx = cx + (G2048_CELL - textLen * 6) / 2;
+            if (tx < cx) tx = cx; // guard: a number too wide for the cell just left-aligns instead of drawing off it
+            int16_t ty = cy + (G2048_CELL - 8) / 2;
+
+            // Dark text on the light levels-0/1 tiles, white on every
+            // more saturated color above that.
+            tft->setTextColor(level <= 1 ? COLOR_BG : 0xFFFF);
+            tft->setCursor(tx, ty);
+            tft->print(label);
+        }
+    }
 }
 
 // =====================================================================
@@ -1823,6 +2303,364 @@ void drawStockWatch()
     tft->setTextColor(COLOR_DIM);
     const char* hint = "5=Refresh *=Back";
     int16_t hx = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
+    tft->setCursor(hx, SCREEN_HEIGHT - 10);
+    tft->print(hint);
+}
+
+// =====================================================================
+// Calculator.
+//
+// Flow: type Num1's digits (0-9), press # to confirm and move to Num2,
+// type Num2's digits, press # again to move into operation selection --
+// there, # moves down the list and 0 moves up, and 5 computes/selects.
+// From the result screen, 5 starts a fresh calculation. * always exits.
+// =====================================================================
+
+struct CalcOp {
+    const char* name;
+};
+
+static const CalcOp calcOps[] = {
+    { "Addition" },
+    { "Subtraction" },
+    { "Division" },
+    { "Multiplication" },
+    { "Percentage of" },
+    { "Raised to power of" },
+    { "Rooted to" },
+    { "Log of" },
+    { "Geometric mean" },
+    { "Permutation (nPr)" },
+    { "Combination (nCr)" },
+};
+#define CALC_OP_COUNT (sizeof(calcOps) / sizeof(calcOps[0]))
+
+static void calculatorInit()
+{
+    calcStage = CALC_STAGE_NUM1;
+    calcNum1Buf[0] = '\0';
+    calcNum2Buf[0] = '\0';
+    calcNum1Len = 0;
+    calcNum2Len = 0;
+    calcOpIndex = 0;
+    calcResult = 0.0;
+    calcHasError = false;
+    calcErrorMsg[0] = '\0';
+}
+
+// Computes calcResult from calcNum1Buf/calcNum2Buf and calcOpIndex,
+// setting calcHasError + calcErrorMsg instead whenever the chosen
+// operation is undefined for the given inputs (divide by zero, log of
+// a non-positive number, r > n for nPr/nCr, etc.) so the UI can show a
+// clear message rather than a garbage or NaN/Inf result.
+static void calculatorCompute()
+{
+    double n1 = atof(calcNum1Buf);
+    double n2 = atof(calcNum2Buf);
+
+    calcHasError = false;
+    calcErrorMsg[0] = '\0';
+    calcResult = 0.0;
+
+    switch (calcOpIndex)
+    {
+        case 0: // Addition
+            calcResult = n1 + n2;
+            break;
+
+        case 1: // Subtraction
+            calcResult = n1 - n2;
+            break;
+
+        case 2: // Division
+            if (n2 == 0.0)
+            {
+                calcHasError = true;
+                strncpy(calcErrorMsg, "Cannot divide by zero", sizeof(calcErrorMsg) - 1);
+            }
+            else
+            {
+                calcResult = n1 / n2;
+            }
+            break;
+
+        case 3: // Multiplication
+            calcResult = n1 * n2;
+            break;
+
+        case 4: // Percentage of -- n1 percent of n2
+            calcResult = (n1 / 100.0) * n2;
+            break;
+
+        case 5: // Raised to power of -- n1 ^ n2
+            calcResult = pow(n1, n2);
+            break;
+
+        case 6: // Rooted to -- the n2-th root of n1
+            if (n2 == 0.0)
+            {
+                calcHasError = true;
+                strncpy(calcErrorMsg, "Cannot root by zero", sizeof(calcErrorMsg) - 1);
+            }
+            else
+            {
+                calcResult = pow(n1, 1.0 / n2);
+            }
+            break;
+
+        case 7: // Log of -- log base n2 of n1
+            if (n1 <= 0.0 || n2 <= 0.0 || n2 == 1.0)
+            {
+                calcHasError = true;
+                strncpy(calcErrorMsg, "Log undefined for inputs", sizeof(calcErrorMsg) - 1);
+            }
+            else
+            {
+                calcResult = log(n1) / log(n2);
+            }
+            break;
+
+        case 8: // Geometric mean -- sqrt(n1 * n2)
+            if (n1 * n2 < 0.0)
+            {
+                calcHasError = true;
+                strncpy(calcErrorMsg, "Undefined: negative product", sizeof(calcErrorMsg) - 1);
+            }
+            else
+            {
+                calcResult = sqrt(n1 * n2);
+            }
+            break;
+
+        case 9:  // Permutation (nPr)
+        case 10: // Combination (nCr)
+        {
+            long n = (long)(n1 + 0.5);
+            long r = (long)(n2 + 0.5);
+
+            if (n < 0 || r < 0 || r > n)
+            {
+                calcHasError = true;
+                strncpy(calcErrorMsg, "Need 0 <= r <= n", sizeof(calcErrorMsg) - 1);
+            }
+            else
+            {
+                // n! / (n-r)! computed as a running product, rather than
+                // two separate full factorials, so it stays in double
+                // range for larger n as long as the final ratio does.
+                double perm = 1.0;
+                for (long i = 0; i < r; i++)
+                {
+                    perm *= (double)(n - i);
+                }
+
+                if (calcOpIndex == 9)
+                {
+                    calcResult = perm;
+                }
+                else
+                {
+                    double rFact = 1.0;
+                    for (long i = 2; i <= r; i++)
+                    {
+                        rFact *= (double)i;
+                    }
+                    calcResult = perm / rFact;
+                }
+            }
+            break;
+        }
+    }
+
+    if (!calcHasError && (isnan(calcResult) || isinf(calcResult)))
+    {
+        calcHasError = true;
+        strncpy(calcErrorMsg, "Result undefined", sizeof(calcErrorMsg) - 1);
+    }
+    calcErrorMsg[sizeof(calcErrorMsg) - 1] = '\0';
+}
+
+// Whole-number results print with no decimal places; anything else
+// prints with at least 5 decimal digits, as asked.
+static void calculatorFormatResult(char* out, size_t outSize)
+{
+    double rounded = round(calcResult);
+    if (fabs(calcResult - rounded) < 1e-9)
+    {
+        snprintf(out, outSize, "%.0f", calcResult);
+    }
+    else
+    {
+        snprintf(out, outSize, "%.5f", calcResult);
+    }
+}
+
+static void calculatorHandleKey(char key)
+{
+    bool isDigit = (key >= '0' && key <= '9');
+
+    if (calcStage == CALC_STAGE_NUM1 || calcStage == CALC_STAGE_NUM2)
+    {
+        char* buf     = (calcStage == CALC_STAGE_NUM1) ? calcNum1Buf : calcNum2Buf;
+        uint8_t* len  = (calcStage == CALC_STAGE_NUM1) ? &calcNum1Len : &calcNum2Len;
+
+        if (isDigit)
+        {
+            if (*len < CALC_MAX_DIGITS)
+            {
+                buf[*len] = key;
+                (*len)++;
+                buf[*len] = '\0';
+                drawCalculator();
+            }
+        }
+        else if (key == '#')
+        {
+            if (*len == 0) return; // need at least one digit before advancing
+
+            if (calcStage == CALC_STAGE_NUM1)
+            {
+                calcStage = CALC_STAGE_NUM2;
+            }
+            else
+            {
+                calcStage = CALC_STAGE_OP;
+                calcOpIndex = 0;
+            }
+            drawCalculator();
+        }
+    }
+    else if (calcStage == CALC_STAGE_OP)
+    {
+        if (key == '#') // down
+        {
+            calcOpIndex = (uint8_t)((calcOpIndex + 1) % CALC_OP_COUNT);
+            drawCalculator();
+        }
+        else if (key == '0') // up
+        {
+            calcOpIndex = (calcOpIndex == 0) ? (uint8_t)(CALC_OP_COUNT - 1) : (uint8_t)(calcOpIndex - 1);
+            drawCalculator();
+        }
+        else if (key == KEY_SELECT)
+        {
+            calculatorCompute();
+            calcStage = CALC_STAGE_RESULT;
+            drawCalculator();
+        }
+    }
+    else if (calcStage == CALC_STAGE_RESULT)
+    {
+        if (key == KEY_SELECT)
+        {
+            calculatorInit();
+            drawCalculator();
+        }
+    }
+}
+
+void drawCalculator()
+{
+    clearContent();
+    drawStatusBar();
+
+    tft->setTextSize(1);
+    tft->setTextColor(COLOR_FG);
+    const char* title = "Calculator";
+    int16_t tx = (SCREEN_WIDTH - (int16_t)strlen(title) * 6) / 2;
+    if (tx < 2) tx = 2;
+    tft->setCursor(tx, CONTENT_TOP + 2);
+    tft->print(title);
+
+    int16_t y = CALC_LINE_Y;
+    char line[32];
+
+    // Num1 -- shown with a trailing cursor while it's still being typed.
+    if (calcStage == CALC_STAGE_NUM1)
+    {
+        snprintf(line, sizeof(line), "Num1: %s_", calcNum1Buf);
+    }
+    else
+    {
+        snprintf(line, sizeof(line), "Num1: %s", calcNum1Buf);
+    }
+    tft->setTextColor(COLOR_FG);
+    tft->setCursor(6, y);
+    tft->print(line);
+    y += CALC_LINE_H;
+
+    // Num2 -- blank until we've left the Num1 stage.
+    if (calcStage != CALC_STAGE_NUM1)
+    {
+        if (calcStage == CALC_STAGE_NUM2)
+        {
+            snprintf(line, sizeof(line), "Num2: %s_", calcNum2Buf);
+        }
+        else
+        {
+            snprintf(line, sizeof(line), "Num2: %s", calcNum2Buf);
+        }
+        tft->setCursor(6, y);
+        tft->print(line);
+    }
+    y += CALC_LINE_H;
+
+    // Operation -- a live "<Name>" while choosing, a plain "Op: Name"
+    // once a result has been computed.
+    if (calcStage == CALC_STAGE_OP || calcStage == CALC_STAGE_RESULT)
+    {
+        char opLine[32];
+        if (calcStage == CALC_STAGE_OP)
+        {
+            tft->setTextColor(COLOR_ACCENT);
+            snprintf(opLine, sizeof(opLine), "<%s>", calcOps[calcOpIndex].name);
+        }
+        else
+        {
+            tft->setTextColor(COLOR_FG);
+            snprintf(opLine, sizeof(opLine), "Op: %s", calcOps[calcOpIndex].name);
+        }
+        tft->setCursor(6, y);
+        tft->print(opLine);
+    }
+    y += CALC_LINE_H;
+
+    // Result / error.
+    if (calcStage == CALC_STAGE_RESULT)
+    {
+        char resLine[32];
+        if (calcHasError)
+        {
+            tft->setTextColor(COLOR_DIM);
+            snprintf(resLine, sizeof(resLine), "%s", calcErrorMsg);
+        }
+        else
+        {
+            char resultStr[24];
+            calculatorFormatResult(resultStr, sizeof(resultStr));
+            tft->setTextColor(COLOR_ACCENT);
+            snprintf(resLine, sizeof(resLine), "= %s", resultStr);
+        }
+        tft->setCursor(6, y);
+        tft->print(resLine);
+    }
+
+    tft->setTextColor(COLOR_DIM);
+    const char* hint;
+    if (calcStage == CALC_STAGE_NUM1 || calcStage == CALC_STAGE_NUM2)
+    {
+        hint = "0-9=Digit #=Next *=Back";
+    }
+    else if (calcStage == CALC_STAGE_OP)
+    {
+        hint = "0=Up #=Down 5=Calc *=Back";
+    }
+    else
+    {
+        hint = "5=New calc *=Back";
+    }
+    int16_t hx = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
+    if (hx < 0) hx = 0;
     tft->setCursor(hx, SCREEN_HEIGHT - 10);
     tft->print(hint);
 }
