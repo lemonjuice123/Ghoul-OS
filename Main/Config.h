@@ -168,6 +168,17 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 #define MATRIX_ROWS    (SCREEN_HEIGHT / 8)
 #define MATRIX_TICK_MS 60UL
 
+// ---------------------------- 2048 GAME LAYOUT ----------------------------
+// Standard 4x4 board. Cell + gap sizes chosen so the whole grid fits
+// under the header line with a little breathing room at the bottom.
+#define G2048_SIZE    4
+#define G2048_CELL    21
+#define G2048_GAP     4
+#define G2048_GRID_W  (G2048_SIZE * G2048_CELL + (G2048_SIZE - 1) * G2048_GAP)
+#define G2048_GRID_H  (G2048_SIZE * G2048_CELL + (G2048_SIZE - 1) * G2048_GAP)
+#define G2048_GRID_X  ((SCREEN_WIDTH - G2048_GRID_W) / 2)
+#define G2048_GRID_Y  (CONTENT_TOP + 14)
+
 // ---------------------------- WIFI SCANNER APP LAYOUT ----------------------------
 // Scrollable list of nearby SSIDs shown by the "WiFi Scanner" app. SSIDs
 // too long to fit their row scroll horizontally (a marquee/ticker) so
@@ -183,11 +194,11 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 // only ever passively scans and never associates to a network, while
 // StockWatch needs a real internet connection to reach Finnhub.
 // >>> Fill these in with your real network's SSID/password. <<<
-#define STOCK_WIFI_SSID     "wifissid"
-#define STOCK_WIFI_PASSWORD "wifipass"
+
 
 // Finnhub API key -- create a free one at https://finnhub.io/register
 // >>> Fill this in with your real Finnhub API key. <<<
+
 
 // The list of ticker symbols tracked is in StockWatch.cpp
 // (stockSymbols[]) -- edit that array to change which companies show up
@@ -221,9 +232,7 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 // real pixel blit performed by drawBitmapIcon().
 #define ICONS_HAVE_DATA 1
 
-
-// Finnhub API key -- create a free one at https://finnhub.io/register
-// >>> Fill this in with your real Finnhub API key. <<<
-#define FINNHUB_API_KEY "apokeiadoiapikeylarp0"
-
+#define FINNHUB_API_KEY "dyeahnicetrywebscraperssihr01qp0a25tvd0"
+#define STOCK_WIFI_SSID     "wifipssid"
+#define STOCK_WIFI_PASSWORD "wifipass"
 #endif // CONFIG_H
