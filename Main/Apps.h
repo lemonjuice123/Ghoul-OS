@@ -33,6 +33,7 @@ void launchMiniPiano();
 void launchKeyTest();
 void launchCalculator();
 void launchMatrix();
+void launch2048();
 
 // App table and count – defined in Apps.cpp.
 extern const App appList[];
