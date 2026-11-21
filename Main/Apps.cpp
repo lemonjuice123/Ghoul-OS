@@ -21,6 +21,7 @@ void launchKeyTest()    {}
 void launchCalculator() {}
 void launchMatrix()     {}
 void launch2048()       {}
+void launchBleKeyboard() {}
 
 // --------------------------------------------------------------------------
 // App table – each entry provides name, description, optional icon, and launch.
@@ -29,11 +30,12 @@ const App appList[] = {
     { "WiFi Scanner", "Scan nearby wireless networks",   iconWifi,      launchWifiScanner },
     { "StockWatch",   "Live stock prices via Finnhub",   iconWifi,      launchStockWatch  },
     { "PackMon",      "Live 802.11 packet monitor",      iconPackMon,   launchPackMon },
+    { "BLE Keybd",    "Bluetooth keyboard + remote",      iconBluetooth, launchBleKeyboard },
     { "Files",        "Browse the SD card file system",  iconFiles,     launchFiles       },
     { "MiniPiano",    "9-key mini piano (keys 1-9)",     iconMusic,     launchMiniPiano   },
     { "Key Test",     "See each keypad press live",      iconKeyTest,   launchKeyTest     },
-    { "Settings",     "Toggle audio feedback on/off",    iconSettings,  launchSettings    },
-    { "Games",        "Launch built-in mini games",      iconGames,     launchGames       },
+    { "Settings",     "Audio, theme, splash and sleep",   iconSettings,  launchSettings    },
+    { "Breakout",     "Bounce the ball, break the bricks", iconGames,   launchGames       },
     { "Calculator",   "Digit-entry calculator",          iconGames,     launchCalculator  },
     { "Matrix",       "Digital rain screensaver",        iconGames,     launchMatrix      },
     { "2048",         "Slide and merge number tiles",    iconGames,     launch2048        },
