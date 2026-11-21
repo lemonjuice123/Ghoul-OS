@@ -48,19 +48,34 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 #define ANIM_DURATION_MS        220UL  // carousel slide duration
 
 // ------------------------------ COLORS (RGB565) -------------------------
-// Retro CRT / terminal theme: monochrome phosphor green on black,
-// inspired by old amber/green terminal readouts (see e.g. the classic
-// "REGISTER CONTROL" synth-tracker screens) and the Pip-Boy's green
-// display. Every screen in the UI draws through these macros rather
-// than hardcoded hex, so changing the theme here re-themes the whole
-// device -- no blue/cyan/white left anywhere.
-#define COLOR_BG         0x0000  // Black
-#define COLOR_FG         0x3FED  // Bright phosphor green -- normal text
-#define COLOR_ACCENT     0xBFF7  // Near-white mint green -- headers/selected text/emphasis
-#define COLOR_ACCENT_DIM 0x1468  // Mid green -- borders, dividers
-#define COLOR_DIM        0x1366  // Dark green -- secondary/hint text
-#define COLOR_STATUSBAR  0x00C1  // Near-black green -- status bar strip
-#define COLOR_SELECT_BG  0x01E3  // Dark green fill -- selection highlight background
+// Retro CRT / terminal look: one monochrome phosphor colour on black,
+// picked to feel like the Pip-Boy's green display.
+//
+// The palette is NOT fixed at compile time: Settings > Colour Theme
+// switches the whole device between seven phosphor colours (Green,
+// Amber, Blue, White, Purple, Red, Pink) and remembers the choice in
+// flash. Every screen still draws through the COLOR_* names below, but
+// those names now expand to runtime variables set by Theme.cpp, so a
+// theme change re-colours the entire UI at once.
+//
+// A few elements deliberately keep their own fixed colour because the
+// colour carries information rather than being decoration: the 2048
+// tiles and the PackMon packet-rate bars.
+extern uint16_t ghColorBg;         // page background (always black)
+extern uint16_t ghColorFg;         // normal text
+extern uint16_t ghColorAccent;     // headers, selected text, emphasis
+extern uint16_t ghColorAccentDim;  // borders, dividers
+extern uint16_t ghColorDim;        // secondary text
+extern uint16_t ghColorStatusbar;  // status bar strip
+extern uint16_t ghColorSelectBg;   // selection highlight fill
+
+#define COLOR_BG         ghColorBg
+#define COLOR_FG         ghColorFg
+#define COLOR_ACCENT     ghColorAccent
+#define COLOR_ACCENT_DIM ghColorAccentDim
+#define COLOR_DIM        ghColorDim
+#define COLOR_STATUSBAR  ghColorStatusbar
+#define COLOR_SELECT_BG  ghColorSelectBg
 
 // ------------------------------ LAYOUT -----------------------------------
 #define STATUSBAR_HEIGHT 14
@@ -76,11 +91,10 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 #define CAROUSEL_ITEM_H        22
 #define CAROUSEL_VISIBLE_ITEMS 5
 
-// Vertical scrollbar drawn along the rightmost edge of the screen,
-// showing progress through the app list -- drawn as a solid rectangle
-// block, not a rounded pill, to match the rest of the theme.
-#define SCROLLBAR_WIDTH 4
-#define SCROLLBAR_GAP   3
+// Top edge of the fixed row viewport the launcher scrolls inside. It is
+// centred in the content area, leaving 2px above and below the five
+// visible rows (5 * 22 = 110px tall).
+#define CAROUSEL_LIST_Y  (CONTENT_TOP + (CONTENT_HEIGHT - (CAROUSEL_VISIBLE_ITEMS * CAROUSEL_ITEM_H)) / 2)
 
 #define STATUSBAR_ICON_SIZE 10
 
@@ -115,8 +129,26 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 #define KEYTEST_GRID_Y (CONTENT_TOP + 18)
 
 // -------------------------- SETTINGS APP LAYOUT ---------------------------
-// A single audio-feedback on/off toggle shown by the "Settings" app.
-#define SETTINGS_TOGGLE_Y (CONTENT_TOP + 40)
+// Four stacked rows: audio feedback, colour theme, splash image and
+// auto-sleep timeout. Up/Down moves the cursor between rows; Select acts
+// on the highlighted row (toggle audio, or open the matching list).
+#define SETTINGS_ROW_X  6
+#define SETTINGS_ROW_W  (SCREEN_WIDTH - 12)
+#define SETTINGS_ROW_Y  (CONTENT_TOP + 16)   // 30
+#define SETTINGS_ROW_H  18
+#define SETTINGS_ROW_GAP 4
+#define SETTINGS_ROW_COUNT 4
+
+// The theme list shown while the colour row is open -- one 12px row per
+// available colour, which is exactly what fits under the title.
+#define SETTINGS_THEME_Y  (CONTENT_TOP + 16) // 30
+#define SETTINGS_THEME_H  12
+
+// The splash-image and sleep-timeout lists: eight 12px rows under the
+// title, scrolling when there are more entries than that.
+#define SETTINGS_LIST_Y        (CONTENT_TOP + 12) // 26
+#define SETTINGS_LIST_H        12
+#define SETTINGS_LIST_VISIBLE  8
 
 // ---------------------------- FILES APP LAYOUT ----------------------------
 // Scrollable directory listing shown by the "Files" app.
@@ -125,11 +157,19 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 #define FILES_LIST_Y        (CONTENT_TOP + 16)
 
 // Simple text preview shown when a file (rather than a folder) is opened.
-#define FILEVIEW_VISIBLE_LINES 10
+// The preview owns the whole panel (no status bar, no filename line) so
+// this is 13 lines of 9px inside the 128px screen.
+#define FILEVIEW_VISIBLE_LINES 13
 #define FILEVIEW_LINE_H         9
 
-// BMP image viewer
-#define BMP_LINE_MAX 320       // max source pixels buffered per row
+// ---------------------------- SPLASH IMAGE --------------------------------
+// How many .bmp files in the SD card's root folder are offered in
+// Settings > Splash. Only the names are stored, never the image itself.
+#define SPLASH_MAX_FILES 24
+
+// BMP image viewer -- images wider or taller than this are refused, which
+// keeps the per-row read buffer small (4 bytes/pixel * BMP_MAX_DIM).
+#define BMP_MAX_DIM 2048
 
 // ---------------------------- MINI PIANO APP LAYOUT ----------------------------
 // 3x3 grid mirroring keys 1-9 on the physical keypad, used by the
@@ -224,6 +264,50 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 #define PACKETMON_CHANNEL_MIN     1
 #define PACKETMON_CHANNEL_MAX     13
 
+// ---------------------------- BLE KEYBOARD APP ----------------------------
+// "BLE Keybd": a Bluetooth LE keyboard/remote. The device advertises this
+// name. It is a standard HID keyboard, built on the BLE stack that ships
+// with the ESP32 Arduino core -- no extra library needed.
+#define BLE_DEVICE_NAME "Ghoul OS Keys"
+
+// Two-option submenu (Keyboard / Remote) shown once a host connects.
+#define BLE_MENU_ROW_Y    (CONTENT_TOP + 30)
+#define BLE_MENU_ROW_H    22
+#define BLE_MENU_ROW_GAP  6
+
+// Keyboard submenu screen: one scrollable row per keystroke, so each key
+// can be sent on its own instead of being laid out as a numpad grid.
+#define BLE_LIST_Y          (CONTENT_TOP + 14)   // 28
+#define BLE_LIST_ROW_H      12
+#define BLE_LIST_VISIBLE    7
+#define BLE_LIST_FLASH_MS   110UL                // how long a sent row stays lit
+
+// Remote screen geometry -- a D-pad of triangles plus the centre square,
+// an ESC button in the top-right corner and two volume boxes at the
+// bottom, laid out so it all fits under the status bar on a 160x128
+// panel with no overlap.
+#define REMOTE_MID_X        (SCREEN_WIDTH / 2)                  // 80
+#define REMOTE_UP_APEX_Y    (CONTENT_TOP + 10)                  // 24
+#define REMOTE_UP_BASE_Y    (REMOTE_UP_APEX_Y + 18)             // 42
+#define REMOTE_UP_HW        12                                  // half-width of the base
+#define REMOTE_ROW_TOP      (REMOTE_UP_BASE_Y + 8)              // 50
+#define REMOTE_ROW_BOTTOM   (REMOTE_ROW_TOP + 20)               // 70
+#define REMOTE_MID_HW       10                                  // half-width of the centre square
+#define REMOTE_ARM_GAP      22                                  // flat edge of the left/right triangles
+#define REMOTE_ARM_LEN      12                                  // how far their point sticks out
+#define REMOTE_DOWN_TOP_Y   (REMOTE_ROW_BOTTOM + 4)             // 74
+#define REMOTE_DOWN_APEX_Y  (REMOTE_DOWN_TOP_Y + 18)            // 92
+#define REMOTE_DOWN_HW      12
+#define REMOTE_VOL_Y        (REMOTE_DOWN_APEX_Y + 8)            // 100
+#define REMOTE_VOL_H        14
+#define REMOTE_VOL_W        64
+#define REMOTE_VOL_LEFT_X   10
+#define REMOTE_VOL_RIGHT_X  (SCREEN_WIDTH - 10 - REMOTE_VOL_W)  // 86
+#define REMOTE_ESC_W        32
+#define REMOTE_ESC_H        13
+#define REMOTE_ESC_X        (SCREEN_WIDTH - 4 - REMOTE_ESC_W)   // 124
+#define REMOTE_ESC_Y        (CONTENT_TOP + 1)                   // 15
+
 // ---------------------------- ICON DATA FLAG ------------------------------
 // All bitmaps in Icons.h are currently empty placeholders (see project
 // brief). drawIcon() renders a safe vector placeholder glyph instead of
@@ -232,7 +316,7 @@ static const uint8_t KEYPAD_COL_PINS[KEYPAD_COLS] = {13, 12, 15, 2}; // == board
 // real pixel blit performed by drawBitmapIcon().
 #define ICONS_HAVE_DATA 1
 
-#define FINNHUB_API_KEY "dyeahnicetrywebscraperssihr01qp0a25tvd0"
-#define STOCK_WIFI_SSID     "wifipssid"
-#define STOCK_WIFI_PASSWORD "wifipass"
+#define FINNHUB_API_KEY "dbumnicetrywebscrapersu3hr01qv51jcep4g"
+#define STOCK_WIFI_SSID     "SSID"
+#define STOCK_WIFI_PASSWORD "PASS"
 #endif // CONFIG_H
