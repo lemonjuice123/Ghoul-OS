@@ -47,6 +47,88 @@ void audioStop()
     noTone(PIEZO_PIN);
 }
 
+// ---------------------------------------------------------------------
+// Boot jingle -- a placeholder "power-on" motif: a rising arpeggio, a
+// short breath, then a falling answer that lands back on the root. Each
+// entry is one note; dur is how long it sounds and the sequencer waits
+// BOOT_TUNE_GAP_MS after it before the next step. Change the notes here
+// to make it your own.
+// ---------------------------------------------------------------------
+struct BootNote
+{
+    uint16_t freq; // Hz (0 = rest)
+    uint16_t dur;  // ms
+};
+
+static const BootNote bootTune[] = {
+    { 440,  90 },  // A4
+    { 554,  90 },  // C#5
+    { 659,  90 },  // E5
+    { 880, 150 },  // A5
+    { 784,  90 },  // G5
+    { 659,  90 },  // E5
+    { 880, 190 },  // A5
+    { 0,   110 },  // breath
+    { 1047, 120 }, // C6
+    { 880,  90 },  // A5
+    { 659,  90 },  // E5
+    { 440, 280 }   // A4 -- root, lets it ring out
+};
+
+#define BOOT_TUNE_COUNT  (sizeof(bootTune) / sizeof(bootTune[0]))
+#define BOOT_TUNE_GAP_MS 16
+
+static bool          bootTunePlaying = false;
+static uint8_t       bootTuneStep = 0;
+static unsigned long bootTuneNext = 0;
+
+void audioBootTuneStart()
+{
+    bootTuneStep = 0;
+    bootTuneNext = millis();
+    bootTunePlaying = audioEnabled;
+}
+
+void audioBootTuneService()
+{
+    if (!bootTunePlaying)
+    {
+        return;
+    }
+
+    unsigned long now = millis();
+    if ((long)(now - bootTuneNext) < 0)
+    {
+        return;
+    }
+
+    if (bootTuneStep >= BOOT_TUNE_COUNT)
+    {
+        bootTunePlaying = false;
+        return;
+    }
+
+    const BootNote &note = bootTune[bootTuneStep++];
+    if (note.freq > 0)
+    {
+        // tone() with a duration is non-blocking and stops itself, so the
+        // splash animation never stalls waiting for a note to finish.
+        tone(PIEZO_PIN, note.freq, note.dur);
+    }
+    else
+    {
+        audioStop();
+    }
+
+    bootTuneNext = now + note.dur + BOOT_TUNE_GAP_MS;
+}
+
+void audioBootTuneStop()
+{
+    bootTunePlaying = false;
+    audioStop();
+}
+
 const char* audioNoteName(uint8_t noteIndex)
 {
     return (noteIndex < 9) ? pianoNames[noteIndex] : "";
