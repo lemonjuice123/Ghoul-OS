@@ -8,6 +8,9 @@
 #include "Icons.h"
 #include "FileBrowser.h"
 #include "Audio.h"
+#include "Theme.h"
+#include "Prefs.h"
+#include "BleHid.h"
 #include "PacketMon.h"
 #include "WifiScan.h"
 #include "StockWatch.h"
@@ -15,11 +18,9 @@
 // =====================================================================
 // Ghoul OS - UI.cpp
 //
-// Handles the boot splash, the two-pane launcher (left = selected app's
-// icon + description, right = animated scrolling list of app names with
-// a scrollbar) and the generic app placeholder screen. Redraws are kept
-// partial wherever possible to avoid flicker: only the regions that
-// actually changed are cleared and repainted.
+// Handles the boot splash, the animated text launcher and every app
+// screen. Redraws are kept partial wherever possible to avoid flicker:
+// only the regions that actually changed are cleared and repainted.
 // =====================================================================
 
 // ------------------------------------------------------------------
@@ -61,12 +62,41 @@ static uint8_t musicLastNote = 255; // 255 = nothing highlighted yet (0-8 = a no
 static uint8_t filesCursor = 0;     // index into the *displayed* list (incl. "..")
 static uint8_t filesScrollTop = 0;  // display index of the first visible row
 
+// ---------------------------- Settings app ---------------------------------
+// Rows: 0 = audio feedback, 1 = colour theme, 2 = splash image,
+// 3 = auto-sleep timeout. Selecting a row opens its list (settingsSub).
+enum SettingsSub : uint8_t
+{
+    SETTINGS_SUB_NONE = 0,
+    SETTINGS_SUB_THEME,
+    SETTINGS_SUB_SPLASH,
+    SETTINGS_SUB_SLEEP
+};
+
+static uint8_t     settingsCursor = 0;
+static SettingsSub settingsSub = SETTINGS_SUB_NONE;
+
+// Splash-image list: entry 0 is always the built-in logo, followed by
+// every .bmp found in the SD card's root folder.
+static char    splashFiles[SPLASH_MAX_FILES][FB_MAX_NAME_LEN + 2];
+static uint8_t splashFileCount = 0;
+static uint8_t splashCursor = 0;
+static uint8_t splashScrollTop = 0;
+
+static uint8_t sleepCursor = 0;
+
+// ---------------------------- Auto sleep -----------------------------------
+// Any key press resets lastActivityMs. When the timeout chosen in
+// Settings elapses the panel is switched off until the next key press.
+static unsigned long lastActivityMs = 0;
+static bool          deviceAsleep = false;
+
 // ----------------------------- File preview -----------------------------
 // FILEVIEW_MAX_LINES stays comfortably under 255 so fileViewLineCount/
 // filePreviewLineOffset can remain plain uint8_t without any risk of
 // wraparound.
 #define FILEVIEW_MAX_LINES 240
-#define FILEVIEW_LINE_LEN  27
+#define FILEVIEW_LINE_LEN  26
 
 static char filePreviewBuffer[FB_PREVIEW_BUF_SIZE + 1];
 static size_t filePreviewLen = 0;
@@ -77,19 +107,6 @@ static uint8_t filePreviewLineOffset = 0; // which wrapped line is scrolled to t
 static bool filePreviewIsBinary = false;        // content looked like binary, not text
 static bool filePreviewBufferTruncated = false; // file is bigger than FB_PREVIEW_BUF_SIZE
 static bool filePreviewLinesTruncated = false;  // more wrapped lines than FILEVIEW_MAX_LINES allows
-
-// ----------------------------- BMP viewer ---------------------------------
-#define BMP_BATCH 16
-static int32_t  bmpWidth, bmpHeight;
-static uint16_t bmpBpp;
-static uint32_t bmpDataOffset;
-static uint32_t bmpRowStride;
-static bool     bmpTopDown;
-static char     bmpFilePath[FB_MAX_PATH_LEN + FB_MAX_NAME_LEN + 2];
-static uint8_t  bmpViewingEntry;
-static uint16_t bmpSrcLine[BMP_LINE_MAX];
-static uint8_t  bmpRowBuf[BMP_LINE_MAX * 4];
-static uint16_t *bmpBatchBuf = nullptr;
 
 // ----------------------------- Breakout game ------------------------------
 static int16_t breakoutPaddleX;
@@ -179,13 +196,18 @@ static const uint16_t g2048TileColors[] = {
 #define G2048_COLOR_COUNT (sizeof(g2048TileColors) / sizeof(g2048TileColors[0]))
 
 // Forward declarations for internal helpers (not part of the public UI.h API)
-static void drawScrollbar();
 static void startCarouselAnimation();
 static void drawKeyTestCell(uint8_t row, uint8_t col, bool highlighted);
 static void handleKeyTestPress(char key);
 static void drawMusicCell(uint8_t row, uint8_t col, bool highlighted);
 static void handleMusicKeyPress(char key);
-static void drawAudioToggleRow();
+static void drawSettingsRow(uint8_t row);
+static void drawThemePicker();
+static void drawSplashPicker();
+static void drawSleepPicker();
+static void scanSplashFiles();
+static void redrawCurrentScreen();
+static bool bmpShowFullScreen(const char* path);
 static bool filesGetDisplayEntry(uint8_t displayIdx, const char** outName, bool* outIsDir, uint32_t* outSize);
 static void formatFileSize(uint32_t size, char* out, size_t outSize);
 static void drawFilesChrome();
@@ -225,6 +247,537 @@ static bool g2048HasMoves();
 static uint8_t g2048TileLevel(uint32_t value);
 
 // =====================================================================
+// BLE keyboard app -- link screen, Keyboard/Remote submenu, on-screen
+// keyboard and the remote D-pad. All Bluetooth work lives in BleHid.cpp;
+// everything below is purely presentation and key routing.
+// =====================================================================
+
+enum BleMenuOption : uint8_t {
+    BLE_MENU_KEYBOARD = 0,
+    BLE_MENU_REMOTE   = 1
+};
+
+enum RemoteButton : uint8_t {
+    REMOTE_BTN_UP = 0,
+    REMOTE_BTN_DOWN,
+    REMOTE_BTN_LEFT,
+    REMOTE_BTN_RIGHT,
+    REMOTE_BTN_ENTER,
+    REMOTE_BTN_ESC,
+    REMOTE_BTN_VOL_UP,
+    REMOTE_BTN_VOL_DOWN,
+    REMOTE_BTN_NONE = 255
+};
+
+static uint8_t bleMenuCursor = BLE_MENU_KEYBOARD; // highlighted submenu row
+static bool    bleUiConnected = false;            // last connection state drawn
+static uint8_t remoteActiveButton = REMOTE_BTN_NONE; // last remote button pressed
+
+// ---- Keyboard screen ------------------------------------------------
+// "Keyboard" opens a scrollable list of the individual keystrokes this
+// app can send: one row per key, Up/Down to choose, Select to send it.
+// Deliberately not a numpad grid -- every entry is a single keystroke.
+enum BleKeystrokeSpecial : uint8_t
+{
+    BLE_SPECIAL_NONE = 0,
+    BLE_SPECIAL_ENTER,
+    BLE_SPECIAL_BACKSPACE,
+    BLE_SPECIAL_TAB,
+    BLE_SPECIAL_SPACE,
+    BLE_SPECIAL_ESCAPE,
+    BLE_SPECIAL_UP,
+    BLE_SPECIAL_DOWN,
+    BLE_SPECIAL_LEFT,
+    BLE_SPECIAL_RIGHT,
+    BLE_SPECIAL_VOL_UP,
+    BLE_SPECIAL_VOL_DOWN
+};
+
+// label  = what the list shows
+// ch     = printable character to type (0 for a named key)
+// special= named key to send when ch is 0
+struct BleKeystrokeEntry
+{
+    const char* label;
+    char        ch;
+    uint8_t     special;
+};
+
+static const BleKeystrokeEntry bleKeystrokeList[] = {
+    { "Enter",        0,   BLE_SPECIAL_ENTER      },
+    { "Backspace",    0,   BLE_SPECIAL_BACKSPACE  },
+    { "Tab",          0,   BLE_SPECIAL_TAB        },
+    { "Space",        0,   BLE_SPECIAL_SPACE      },
+    { "Escape",       0,   BLE_SPECIAL_ESCAPE     },
+    { "Up arrow",     0,   BLE_SPECIAL_UP         },
+    { "Down arrow",   0,   BLE_SPECIAL_DOWN       },
+    { "Left arrow",   0,   BLE_SPECIAL_LEFT       },
+    { "Right arrow",  0,   BLE_SPECIAL_RIGHT      },
+    { "Volume up",    0,   BLE_SPECIAL_VOL_UP     },
+    { "Volume down",  0,   BLE_SPECIAL_VOL_DOWN   },
+    { "1", '1', BLE_SPECIAL_NONE },
+    { "2", '2', BLE_SPECIAL_NONE },
+    { "3", '3', BLE_SPECIAL_NONE },
+    { "4", '4', BLE_SPECIAL_NONE },
+    { "5", '5', BLE_SPECIAL_NONE },
+    { "6", '6', BLE_SPECIAL_NONE },
+    { "7", '7', BLE_SPECIAL_NONE },
+    { "8", '8', BLE_SPECIAL_NONE },
+    { "9", '9', BLE_SPECIAL_NONE },
+    { "0", '0', BLE_SPECIAL_NONE },
+    { "*", '*', BLE_SPECIAL_NONE },
+    { "#", '#', BLE_SPECIAL_NONE },
+    { "A", 'A', BLE_SPECIAL_NONE },
+    { "B", 'B', BLE_SPECIAL_NONE },
+    { "C", 'C', BLE_SPECIAL_NONE },
+    { "D", 'D', BLE_SPECIAL_NONE }
+};
+
+static const uint8_t BLE_KEYSTROKE_COUNT =
+    (uint8_t)(sizeof(bleKeystrokeList) / sizeof(bleKeystrokeList[0]));
+
+static uint8_t       bleKbCursor     = 0;    // highlighted keystroke
+static uint8_t       bleKbScrollTop  = 0;    // first row on screen
+static uint8_t       bleKbFlashRow   = 0xFF; // row just sent (0xFF = none)
+static unsigned long bleKbFlashUntil = 0;    // when that flash ends
+
+// Draws one row of the keystroke list (only when it is on screen).
+static void drawBleKeyboardRow(uint8_t index)
+{
+    if (index >= BLE_KEYSTROKE_COUNT) return;
+    if (index < bleKbScrollTop) return;
+    if (index >= (uint8_t)(bleKbScrollTop + BLE_LIST_VISIBLE)) return;
+
+    int16_t slot = (int16_t)(index - bleKbScrollTop);
+    int16_t x = 8;
+    int16_t y = BLE_LIST_Y + slot * BLE_LIST_ROW_H;
+    int16_t w = SCREEN_WIDTH - 16;
+    int16_t h = BLE_LIST_ROW_H - 2;
+
+    bool flashing   = (bleKbFlashRow == index);
+    bool cursorHere = (index == bleKbCursor);
+
+    tft->fillRect(x, y, w, h, COLOR_BG);
+
+    if (flashing)
+    {
+        tft->fillRect(x, y, w, h, COLOR_ACCENT);
+    }
+    else if (cursorHere)
+    {
+        tft->fillRect(x, y, w, h, COLOR_SELECT_BG);
+        tft->drawRect(x, y, w, h, COLOR_ACCENT_DIM);
+    }
+
+    tft->setTextSize(1);
+    tft->setTextColor(flashing ? COLOR_BG : (cursorHere ? COLOR_FG : COLOR_DIM));
+    tft->setCursor(x + 5, y + (h - 8) / 2);
+    tft->print(bleKeystrokeList[index].label);
+}
+
+// Thin scrollbar on the right edge, so it is obvious the list continues.
+static void drawBleKeyboardScrollBar()
+{
+    int16_t x = SCREEN_WIDTH - 5;
+    int16_t y = BLE_LIST_Y;
+    int16_t h = BLE_LIST_VISIBLE * BLE_LIST_ROW_H;
+
+    tft->fillRect(x, y, 3, h, COLOR_BG);
+
+    if (BLE_KEYSTROKE_COUNT <= BLE_LIST_VISIBLE)
+    {
+        return;
+    }
+
+    tft->drawRect(x, y, 3, h, COLOR_DIM);
+
+    int16_t thumbH = (int16_t)((int32_t)h * BLE_LIST_VISIBLE / BLE_KEYSTROKE_COUNT);
+    if (thumbH < 6) thumbH = 6;
+
+    int16_t span   = h - thumbH;
+    int16_t thumbY = y + (int16_t)((int32_t)span * bleKbScrollTop /
+                                   (BLE_KEYSTROKE_COUNT - BLE_LIST_VISIBLE));
+
+    tft->fillRect(x, thumbY, 3, thumbH, COLOR_FG);
+}
+
+// Repaints every visible row plus the scrollbar -- used when the list is
+// first shown and whenever it scrolls.
+static void drawBleKeyboardRows()
+{
+    for (uint8_t i = 0; i < BLE_LIST_VISIBLE; i++)
+    {
+        uint8_t index = (uint8_t)(bleKbScrollTop + i);
+
+        if (index >= BLE_KEYSTROKE_COUNT)
+        {
+            int16_t y = BLE_LIST_Y + i * BLE_LIST_ROW_H;
+            tft->fillRect(8, y, SCREEN_WIDTH - 16, BLE_LIST_ROW_H - 2, COLOR_BG);
+            continue;
+        }
+
+        drawBleKeyboardRow(index);
+    }
+
+    drawBleKeyboardScrollBar();
+}
+
+// Moves the highlight by one row, scrolling the list if it runs off.
+static void bleKbMoveCursor(int8_t delta)
+{
+    int16_t next = (int16_t)bleKbCursor + delta;
+    if (next < 0 || next >= (int16_t)BLE_KEYSTROKE_COUNT)
+    {
+        return;
+    }
+
+    uint8_t previous    = bleKbCursor;
+    uint8_t previousTop = bleKbScrollTop;
+    bleKbCursor = (uint8_t)next;
+
+    if (bleKbCursor < bleKbScrollTop)
+    {
+        bleKbScrollTop = bleKbCursor;
+    }
+    else if (bleKbCursor >= (uint8_t)(bleKbScrollTop + BLE_LIST_VISIBLE))
+    {
+        bleKbScrollTop = (uint8_t)(bleKbCursor - BLE_LIST_VISIBLE + 1);
+    }
+
+    if (bleKbScrollTop != previousTop)
+    {
+        drawBleKeyboardRows();
+    }
+    else
+    {
+        drawBleKeyboardRow(previous);
+        drawBleKeyboardRow(bleKbCursor);
+    }
+}
+
+// Sends the given keystroke over BLE and lights its row briefly so the
+// send is visible on the panel.
+static void sendBleKeystroke(uint8_t index)
+{
+    if (index >= BLE_KEYSTROKE_COUNT)
+    {
+        return;
+    }
+
+    const BleKeystrokeEntry &entry = bleKeystrokeList[index];
+
+    if (bleHidIsConnected())
+    {
+        if (entry.ch != 0)
+        {
+            bleHidSendChar(entry.ch);
+        }
+        else
+        {
+            switch (entry.special)
+            {
+                case BLE_SPECIAL_ENTER:     bleHidSendEnter();      break;
+                case BLE_SPECIAL_BACKSPACE: bleHidSendBackspace();  break;
+                case BLE_SPECIAL_TAB:       bleHidSendTab();        break;
+                case BLE_SPECIAL_SPACE:     bleHidSendSpace();      break;
+                case BLE_SPECIAL_ESCAPE:    bleHidSendEscape();     break;
+                case BLE_SPECIAL_UP:        bleHidSendUp();         break;
+                case BLE_SPECIAL_DOWN:      bleHidSendDown();       break;
+                case BLE_SPECIAL_LEFT:      bleHidSendLeft();       break;
+                case BLE_SPECIAL_RIGHT:     bleHidSendRight();      break;
+                case BLE_SPECIAL_VOL_UP:    bleHidSendVolumeUp();   break;
+                case BLE_SPECIAL_VOL_DOWN:  bleHidSendVolumeDown(); break;
+                default: break;
+            }
+        }
+    }
+
+    bleKbFlashRow   = index;
+    bleKbFlashUntil = millis() + BLE_LIST_FLASH_MS;
+    drawBleKeyboardRow(index);
+}
+
+// Draws one labelled box (ESC / VOL UP / VOL DOWN), filled when active.
+static void drawRemoteBox(int16_t x, int16_t y, int16_t w, int16_t h,
+                          const char* label, bool active)
+{
+    tft->fillRect(x, y, w, h, active ? COLOR_ACCENT : COLOR_BG);
+    tft->drawRect(x, y, w, h, active ? COLOR_ACCENT : COLOR_FG);
+
+    tft->setTextSize(1);
+    tft->setTextColor(active ? COLOR_BG : COLOR_FG);
+    int16_t lx = x + (w - (int16_t)strlen(label) * 6) / 2;
+    int16_t ly = y + (h - 8) / 2;
+    tft->setCursor(lx, ly);
+    tft->print(label);
+}
+
+// Draws one button of the remote screen. active = filled solid (the
+// "this is the button you just pressed" highlight); inactive = hollow
+// outline, so only one shape is ever lit at a time.
+static void drawRemoteButton(uint8_t button, bool active)
+{
+    uint16_t fill = active ? COLOR_ACCENT : COLOR_BG;
+    uint16_t line = active ? COLOR_ACCENT : COLOR_FG;
+    int16_t  midY = (REMOTE_ROW_TOP + REMOTE_ROW_BOTTOM) / 2;
+
+    switch (button)
+    {
+        case REMOTE_BTN_UP:
+            tft->fillTriangle(REMOTE_MID_X, REMOTE_UP_APEX_Y,
+                              REMOTE_MID_X - REMOTE_UP_HW, REMOTE_UP_BASE_Y,
+                              REMOTE_MID_X + REMOTE_UP_HW, REMOTE_UP_BASE_Y, fill);
+            tft->drawTriangle(REMOTE_MID_X, REMOTE_UP_APEX_Y,
+                              REMOTE_MID_X - REMOTE_UP_HW, REMOTE_UP_BASE_Y,
+                              REMOTE_MID_X + REMOTE_UP_HW, REMOTE_UP_BASE_Y, line);
+            break;
+
+        case REMOTE_BTN_DOWN:
+            tft->fillTriangle(REMOTE_MID_X - REMOTE_DOWN_HW, REMOTE_DOWN_TOP_Y,
+                              REMOTE_MID_X + REMOTE_DOWN_HW, REMOTE_DOWN_TOP_Y,
+                              REMOTE_MID_X, REMOTE_DOWN_APEX_Y, fill);
+            tft->drawTriangle(REMOTE_MID_X - REMOTE_DOWN_HW, REMOTE_DOWN_TOP_Y,
+                              REMOTE_MID_X + REMOTE_DOWN_HW, REMOTE_DOWN_TOP_Y,
+                              REMOTE_MID_X, REMOTE_DOWN_APEX_Y, line);
+            break;
+
+        case REMOTE_BTN_LEFT:
+            // Flat edge on the right (facing the centre square), point to the left.
+            tft->fillTriangle(REMOTE_MID_X - REMOTE_ARM_GAP, REMOTE_ROW_TOP,
+                              REMOTE_MID_X - REMOTE_ARM_GAP, REMOTE_ROW_BOTTOM,
+                              REMOTE_MID_X - REMOTE_ARM_GAP - REMOTE_ARM_LEN, midY, fill);
+            tft->drawTriangle(REMOTE_MID_X - REMOTE_ARM_GAP, REMOTE_ROW_TOP,
+                              REMOTE_MID_X - REMOTE_ARM_GAP, REMOTE_ROW_BOTTOM,
+                              REMOTE_MID_X - REMOTE_ARM_GAP - REMOTE_ARM_LEN, midY, line);
+            break;
+
+        case REMOTE_BTN_RIGHT:
+            tft->fillTriangle(REMOTE_MID_X + REMOTE_ARM_GAP, REMOTE_ROW_TOP,
+                              REMOTE_MID_X + REMOTE_ARM_GAP, REMOTE_ROW_BOTTOM,
+                              REMOTE_MID_X + REMOTE_ARM_GAP + REMOTE_ARM_LEN, midY, fill);
+            tft->drawTriangle(REMOTE_MID_X + REMOTE_ARM_GAP, REMOTE_ROW_TOP,
+                              REMOTE_MID_X + REMOTE_ARM_GAP, REMOTE_ROW_BOTTOM,
+                              REMOTE_MID_X + REMOTE_ARM_GAP + REMOTE_ARM_LEN, midY, line);
+            break;
+
+        case REMOTE_BTN_ENTER:
+        {
+            int16_t x = REMOTE_MID_X - REMOTE_MID_HW;
+            int16_t w = REMOTE_MID_HW * 2;
+            int16_t h = REMOTE_ROW_BOTTOM - REMOTE_ROW_TOP;
+            tft->fillRect(x, REMOTE_ROW_TOP, w, h, fill);
+            tft->drawRect(x, REMOTE_ROW_TOP, w, h, line);
+            break;
+        }
+
+        case REMOTE_BTN_ESC:
+            drawRemoteBox(REMOTE_ESC_X, REMOTE_ESC_Y, REMOTE_ESC_W, REMOTE_ESC_H,
+                          "esc", active);
+            break;
+
+        case REMOTE_BTN_VOL_UP:
+            drawRemoteBox(REMOTE_VOL_LEFT_X, REMOTE_VOL_Y, REMOTE_VOL_W, REMOTE_VOL_H,
+                          "VOL UP", active);
+            break;
+
+        case REMOTE_BTN_VOL_DOWN:
+            drawRemoteBox(REMOTE_VOL_RIGHT_X, REMOTE_VOL_Y, REMOTE_VOL_W, REMOTE_VOL_H,
+                          "VOL DOWN", active);
+            break;
+
+        default:
+            break;
+    }
+}
+
+// Draws one row of the Keyboard/Remote submenu.
+static void drawBleMenuRow(uint8_t option, bool selected)
+{
+    int16_t y = BLE_MENU_ROW_Y + option * (BLE_MENU_ROW_H + BLE_MENU_ROW_GAP);
+    int16_t x = RIGHT_PANEL_X;
+    int16_t w = RIGHT_PANEL_W;
+
+    tft->fillRect(x, y, w, BLE_MENU_ROW_H, selected ? COLOR_SELECT_BG : COLOR_BG);
+    tft->drawRect(x, y, w, BLE_MENU_ROW_H, selected ? COLOR_ACCENT : COLOR_DIM);
+
+    const char* label = (option == BLE_MENU_KEYBOARD) ? "Keyboard" : "Remote";
+    tft->setTextSize(2);
+    tft->setTextColor(selected ? COLOR_ACCENT : COLOR_FG);
+    tft->setCursor(x + 10, y + 3);
+    tft->print(label);
+
+    if (selected)
+    {
+        // Small solid arrow on the right edge of the highlighted row.
+        tft->fillTriangle(x + w - 14, y + 6,
+                          x + w - 14, y + BLE_MENU_ROW_H - 6,
+                          x + w - 7, y + BLE_MENU_ROW_H / 2, COLOR_ACCENT);
+    }
+}
+
+// Link screen: shows the advertising/pairing state until a host connects,
+// then the two-option submenu (Keyboard / Remote).
+void drawBleKeyboard()
+{
+    clearContent();
+    drawStatusBar();
+
+    tft->setTextSize(1);
+    tft->setTextColor(COLOR_FG);
+    const char* title = "BLE KEYBOARD";
+    int16_t titleX = (SCREEN_WIDTH - (int16_t)strlen(title) * 6) / 2;
+    tft->setCursor(titleX, CONTENT_TOP + 2);
+    tft->print(title);
+
+    bool connected = bleHidIsConnected();
+
+    const char* status;
+    uint16_t statusColor;
+    if (connected)
+    {
+        status = "CONNECTED";
+        statusColor = COLOR_ACCENT;
+    }
+    else
+    {
+        status = "advertising...";
+        statusColor = COLOR_FG;
+    }
+
+    int16_t statusX = (SCREEN_WIDTH - (int16_t)strlen(status) * 6) / 2;
+    if (statusX < 2) statusX = 2;
+    tft->setTextColor(statusColor);
+    tft->setCursor(statusX, CONTENT_TOP + 14);
+    tft->print(status);
+
+    if (connected)
+    {
+        drawBleMenuRow(BLE_MENU_KEYBOARD, bleMenuCursor == BLE_MENU_KEYBOARD);
+        drawBleMenuRow(BLE_MENU_REMOTE,   bleMenuCursor == BLE_MENU_REMOTE);
+
+        const char* desc = (bleMenuCursor == BLE_MENU_KEYBOARD)
+                         ? "Pick a key to send"
+                         : "Arrows + media keys";
+        tft->setTextColor(COLOR_DIM);
+        int16_t dx = (SCREEN_WIDTH - (int16_t)strlen(desc) * 6) / 2;
+        tft->setCursor(dx, BLE_MENU_ROW_Y + 2 * (BLE_MENU_ROW_H + BLE_MENU_ROW_GAP) + 4);
+        tft->print(desc);
+    }
+    else
+    {
+        const char* line1 = "Pair from your host with:";
+        int16_t x1 = (SCREEN_WIDTH - (int16_t)strlen(line1) * 6) / 2;
+        if (x1 < 2) x1 = 2;
+        tft->setTextColor(COLOR_FG);
+        tft->setCursor(x1, CONTENT_TOP + 28);
+        tft->print(line1);
+
+        tft->setTextSize(2);
+        tft->setTextColor(COLOR_ACCENT);
+        int16_t nameX = (SCREEN_WIDTH - (int16_t)strlen(BLE_DEVICE_NAME) * 12) / 2;
+        if (nameX < 2) nameX = 2;
+        tft->setCursor(nameX, CONTENT_TOP + 40);
+        tft->print(BLE_DEVICE_NAME);
+        tft->setTextSize(1);
+
+        const char* line2 = "Settings > Bluetooth";
+        int16_t x2 = (SCREEN_WIDTH - (int16_t)strlen(line2) * 6) / 2;
+        tft->setTextColor(COLOR_DIM);
+        tft->setCursor(x2, CONTENT_TOP + 62);
+        tft->print(line2);
+    }
+}
+
+// Keyboard screen: a scrollable list of every keystroke this app can
+// send, one per row. Up/Down move the highlight and Select sends that
+// key; the row lights solid for a moment so the send is visible.
+void drawBleKeyboardView()
+{
+    clearContent();
+    drawStatusBar();
+
+    tft->setTextSize(1);
+    tft->setTextColor(COLOR_FG);
+    const char* title = "KEYSTROKES";
+    int16_t titleX = (SCREEN_WIDTH - (int16_t)strlen(title) * 6) / 2;
+    tft->setCursor(titleX, CONTENT_TOP + 2);
+    tft->print(title);
+
+    drawBleKeyboardRows();
+}
+
+// Remote screen: D-pad of triangles, centre square (Enter), ESC corner
+// button and the two volume boxes, exactly as drawn in the layout sketch.
+void drawBleRemote()
+{
+    clearContent();
+    drawStatusBar();
+
+    tft->setTextSize(1);
+    tft->setTextColor(COLOR_FG);
+    tft->setCursor(4, CONTENT_TOP + 2);
+    tft->print("REMOTE");
+
+    for (uint8_t b = REMOTE_BTN_UP; b <= REMOTE_BTN_VOL_DOWN; b++)
+    {
+        drawRemoteButton(b, false);
+    }
+    remoteActiveButton = REMOTE_BTN_NONE;
+}
+
+// Maps a keypad press to the remote layout, lights that shape, and sends
+// the matching keystroke.
+static void handleBleRemoteKey(char key)
+{
+    uint8_t button = REMOTE_BTN_NONE;
+
+    switch (key)
+    {
+        case '2': button = REMOTE_BTN_UP;       break; // up arrow
+        case '6': button = REMOTE_BTN_RIGHT;    break; // right arrow
+        case '4': button = REMOTE_BTN_LEFT;     break; // left arrow
+        case '8': button = REMOTE_BTN_DOWN;     break; // down arrow
+        case '5': button = REMOTE_BTN_ENTER;    break; // enter
+        case '0': button = REMOTE_BTN_ESC;      break; // escape
+        case '1': button = REMOTE_BTN_VOL_DOWN; break; // volume down
+        case '3': button = REMOTE_BTN_VOL_UP;   break; // volume up
+        default:  return;                              // any other key does nothing
+    }
+
+    // '0' and '5' are also the OS's nav keys, so they already clicked at
+    // the top of uiHandleKey(); beep for the rest to keep feedback even.
+    if (key != KEY_UP && key != KEY_SELECT)
+    {
+        audioBeepNav();
+    }
+
+    if (remoteActiveButton != REMOTE_BTN_NONE && remoteActiveButton != button)
+    {
+        drawRemoteButton(remoteActiveButton, false);
+    }
+    drawRemoteButton(button, true);
+    remoteActiveButton = button;
+
+    if (!bleHidIsConnected())
+    {
+        return;
+    }
+
+    switch (button)
+    {
+        case REMOTE_BTN_UP:       bleHidSendUp();         break;
+        case REMOTE_BTN_DOWN:     bleHidSendDown();       break;
+        case REMOTE_BTN_LEFT:     bleHidSendLeft();       break;
+        case REMOTE_BTN_RIGHT:    bleHidSendRight();      break;
+        case REMOTE_BTN_ENTER:    bleHidSendEnter();      break;
+        case REMOTE_BTN_ESC:      bleHidSendEscape();     break;
+        case REMOTE_BTN_VOL_UP:   bleHidSendVolumeUp();   break;
+        case REMOTE_BTN_VOL_DOWN: bleHidSendVolumeDown(); break;
+        default: break;
+    }
+}
+
+// =====================================================================
 // Lifecycle
 // =====================================================================
 
@@ -242,6 +795,18 @@ void uiInit(Adafruit_ST7735 *displayPtr)
 
 void uiHandleKey(char key)
 {
+    // Any key press counts as activity and wakes a sleeping panel. The
+    // press that wakes it is consumed, so it does not also launch or
+    // scroll anything.
+    lastActivityMs = millis();
+    if (deviceAsleep)
+    {
+        tft->enableDisplay(true);
+        deviceAsleep = false;
+        redrawCurrentScreen();
+        return;
+    }
+
     // Short audio click on every navigation press, the same way small
     // handheld devices (e.g. M5Stick) give audio feedback. Does nothing
     // if audio feedback is currently disabled in Settings.
@@ -281,6 +846,8 @@ void uiHandleKey(char key)
             else if (appList[currentAppIndex].launch == launchSettings)
             {
                 currentState = SETTINGS;
+                settingsCursor = 0;
+                settingsSub = SETTINGS_SUB_NONE;
                 drawSettings();
             }
             else if (appList[currentAppIndex].launch == launchFiles)
@@ -342,6 +909,15 @@ void uiHandleKey(char key)
                 g2048Init();
                 drawGame2048();
             }
+            else if (appList[currentAppIndex].launch == launchBleKeyboard)
+            {
+                currentState = BLEKEY;
+                bleMenuCursor = BLE_MENU_KEYBOARD;
+                drawBleKeyboard();  // "advertising..." before the BLE stack spins up
+                bleHidBegin();      // no-op if it is already running
+                bleUiConnected = bleHidIsConnected();
+                drawBleKeyboard();
+            }
             else
             {
                 currentState = APP;
@@ -376,18 +952,149 @@ void uiHandleKey(char key)
     }
     else if (currentState == SETTINGS)
     {
-        if (key == KEY_BACK)
+        if (settingsSub == SETTINGS_SUB_THEME)
+        {
+            // Choosing a colour: Up/Down cycle through the available
+            // themes and each one is applied (and previewed) instantly.
+            // Back confirms the choice, saves it to flash and returns to
+            // the settings rows.
+            uint8_t count = themeCount();
+            if (key == KEY_UP)
+            {
+                uint8_t i = themeGetIndex();
+                themeSetIndex(i == 0 ? (uint8_t)(count - 1) : (uint8_t)(i - 1));
+                drawThemePicker();
+            }
+            else if (key == KEY_DOWN)
+            {
+                themeSetIndex((uint8_t)((themeGetIndex() + 1) % count));
+                drawThemePicker();
+            }
+            else if (key == KEY_BACK || key == KEY_SELECT)
+            {
+                themeSave();
+                settingsSub = SETTINGS_SUB_NONE;
+                drawSettings();
+            }
+        }
+        else if (settingsSub == SETTINGS_SUB_SPLASH)
+        {
+            // Pick a .bmp from the card's root folder, or keep the
+            // built-in logo. Select stores the choice; Back leaves it
+            // untouched.
+            uint8_t total = (uint8_t)(splashFileCount + 1);
+
+            if (key == KEY_UP)
+            {
+                if (splashCursor > 0)
+                {
+                    splashCursor--;
+                    if (splashCursor < splashScrollTop) splashScrollTop = splashCursor;
+                    drawSplashPicker();
+                }
+            }
+            else if (key == KEY_DOWN)
+            {
+                if (splashCursor + 1 < total)
+                {
+                    splashCursor++;
+                    if (splashCursor >= splashScrollTop + SETTINGS_LIST_VISIBLE)
+                        splashScrollTop = (uint8_t)(splashCursor - SETTINGS_LIST_VISIBLE + 1);
+                    drawSplashPicker();
+                }
+            }
+            else if (key == KEY_SELECT)
+            {
+                prefsSetSplashPath(splashCursor == 0 ? "" : splashFiles[splashCursor - 1]);
+                settingsSub = SETTINGS_SUB_NONE;
+                drawSettings();
+            }
+            else if (key == KEY_BACK)
+            {
+                settingsSub = SETTINGS_SUB_NONE;
+                drawSettings();
+            }
+        }
+        else if (settingsSub == SETTINGS_SUB_SLEEP)
+        {
+            // How long the device may sit idle before the panel switches
+            // off. Select stores the choice; Back leaves it untouched.
+            if (key == KEY_UP)
+            {
+                if (sleepCursor > 0)
+                {
+                    sleepCursor--;
+                    drawSleepPicker();
+                }
+            }
+            else if (key == KEY_DOWN)
+            {
+                if (sleepCursor + 1 < prefsSleepCount())
+                {
+                    sleepCursor++;
+                    drawSleepPicker();
+                }
+            }
+            else if (key == KEY_SELECT)
+            {
+                prefsSetSleepIndex(sleepCursor);
+                settingsSub = SETTINGS_SUB_NONE;
+                drawSettings();
+            }
+            else if (key == KEY_BACK)
+            {
+                settingsSub = SETTINGS_SUB_NONE;
+                drawSettings();
+            }
+        }
+        else if (key == KEY_BACK)
         {
             currentState = MENU;
             drawMenu(true);
         }
+        else if (key == KEY_UP)
+        {
+            if (settingsCursor > 0)
+            {
+                settingsCursor--;
+                drawSettings();
+            }
+        }
+        else if (key == KEY_DOWN)
+        {
+            if (settingsCursor + 1 < SETTINGS_ROW_COUNT)
+            {
+                settingsCursor++;
+                drawSettings();
+            }
+        }
         else if (key == KEY_SELECT)
         {
-            audioSetEnabled(!audioIsEnabled());
-            drawAudioToggleRow();
+            if (settingsCursor == 0)
+            {
+                audioSetEnabled(!audioIsEnabled());
+                drawSettingsRow(0);
+            }
+            else if (settingsCursor == 1)
+            {
+                settingsSub = SETTINGS_SUB_THEME;
+                drawThemePicker();
+            }
+            else if (settingsCursor == 2)
+            {
+                scanSplashFiles();
+                splashCursor = 0;
+                splashScrollTop = 0;
+                settingsSub = SETTINGS_SUB_SPLASH;
+                drawSplashPicker();
+            }
+            else
+            {
+                sleepCursor = prefsSleepIndex();
+                settingsSub = SETTINGS_SUB_SLEEP;
+                drawSleepPicker();
+            }
         }
-        // KEY_UP/KEY_DOWN intentionally do nothing -- there's only one
-        // setting here, so there's nothing to navigate between.
     }
     else if (currentState == MINIPIANO)
     {
@@ -552,6 +1259,89 @@ void uiHandleKey(char key)
             g2048HandleKey(key);
         }
     }
+    else if (currentState == BLEKEY)
+    {
+        if (key == KEY_BACK)
+        {
+            // The BLE link is deliberately left up: leaving the app should
+            // not drop the pairing, so the host stays connected.
+            currentState = MENU;
+            drawMenu(true);
+        }
+        else if (!bleHidIsConnected())
+        {
+            // Nothing to choose from until a host connects.
+        }
+        else if (key == KEY_UP)
+        {
+            if (bleMenuCursor > BLE_MENU_KEYBOARD)
+            {
+                bleMenuCursor--;
+                drawBleKeyboard();
+            }
+        }
+        else if (key == KEY_DOWN)
+        {
+            if (bleMenuCursor < BLE_MENU_REMOTE)
+            {
+                bleMenuCursor++;
+                drawBleKeyboard();
+            }
+        }
+        else if (key == KEY_SELECT)
+        {
+            if (bleMenuCursor == BLE_MENU_KEYBOARD)
+            {
+                currentState = BLEKB;
+                bleKbFlashRow = 0xFF; // no stale flash from last time
+                if (bleKbCursor < bleKbScrollTop)
+                {
+                    bleKbScrollTop = bleKbCursor;
+                }
+                drawBleKeyboardView();
+            }
+            else
+            {
+                currentState = BLEREMOTE;
+                drawBleRemote();
+            }
+        }
+    }
+    else if (currentState == BLEKB)
+    {
+        if (key == KEY_BACK)
+        {
+            currentState = BLEKEY;
+            drawBleKeyboard();
+        }
+        else if (key == KEY_UP)
+        {
+            bleKbMoveCursor(-1);
+        }
+        else if (key == KEY_DOWN)
+        {
+            bleKbMoveCursor(1);
+        }
+        else if (key == KEY_SELECT)
+        {
+            sendBleKeystroke(bleKbCursor);
+        }
+        // Anything else has nothing to send: the list is the only way to
+        // pick a keystroke, which keeps this screen to one key per row.
+    }
+    else if (currentState == BLEREMOTE)
+    {
+        if (key == KEY_BACK)
+        {
+            currentState = BLEKEY;
+            bleMenuCursor = BLE_MENU_REMOTE;
+            drawBleKeyboard();
+        }
+        else
+        {
+            handleBleRemoteKey(key);
+        }
+    }
     else if (currentState == FILES)
     {
         if (!sdReady)
@@ -659,6 +1449,8 @@ void uiHandleKey(char key)
     {
         if (key == KEY_BACK)
         {
+            // The viewer's row buffer is allocated and freed inside
+            // drawBmpView(), so leaving is just a state change.
             currentState = FILES;
             drawFilesReturn();
         }
@@ -669,13 +1461,36 @@ void uiTick()
 {
     unsigned long now = millis();
 
+    // A sleeping panel does nothing at all until a key wakes it -- no
+    // animation, no SD/network work, no sound.
+    if (deviceAsleep)
+    {
+        return;
+    }
+
+    // Advances the boot jingle's note sequencer. Silent and cheap once the
+    // melody has finished or the splash has ended.
+    audioBootTuneService();
+
     if (currentState == BOOT)
     {
         if (now - bootStartTime >= BOOT_SPLASH_DURATION_MS)
         {
+            audioBootTuneStop();
             currentState = MENU;
             drawMenu(true);
         }
+        return;
+    }
+
+    // Auto sleep: once the timeout chosen in Settings has passed without
+    // a key press, switch the display off. Any key press wakes it.
+    uint16_t sleepSecs = prefsSleepSeconds(prefsSleepIndex());
+    if (sleepSecs > 0 && (now - lastActivityMs) >= (unsigned long)sleepSecs * 1000UL)
+    {
+        audioStop();
+        tft->enableDisplay(false);
+        deviceAsleep = true;
         return;
     }
 
@@ -743,6 +1558,35 @@ void uiTick()
             drawWifiScannerList();
         }
     }
+    else if (currentState == BLEKEY || currentState == BLEKB || currentState == BLEREMOTE)
+    {
+        // Let the "keystroke sent" flash fade back to the normal row.
+        if (currentState == BLEKB && bleKbFlashRow != 0xFF &&
+            (long)(now - bleKbFlashUntil) >= 0)
+        {
+            uint8_t sentRow = bleKbFlashRow;
+            bleKbFlashRow = 0xFF;
+            drawBleKeyboardRow(sentRow);
+        }
+
+        // Follow the link: reveal the submenu the moment a host pairs,
+        // and fall back to the link screen if the host walks away.
+        bool connected = bleHidIsConnected();
+        if (connected != bleUiConnected)
+        {
+            bleUiConnected = connected;
+            if (connected)
+            {
+                drawBleKeyboard(); // now shows Keyboard / Remote
+            }
+            else
+            {
+                currentState = BLEKEY;
+                bleMenuCursor = BLE_MENU_KEYBOARD;
+                drawBleKeyboard();
+            }
+        }
+    }
     else if (currentState == MATRIX)
     {
         static unsigned long lastMatrixTick = 0;
@@ -760,11 +1604,33 @@ void uiTick()
 
 void drawBoot()
 {
-    // Full-screen boot logo, blitted from the RGB565 PROGMEM array in
-    // Icons.h (bootLogo -- already sized to exactly SCREEN_WIDTH x
-    // SCREEN_HEIGHT, 20480 entries). Shown for BOOT_SPLASH_DURATION_MS
-    // (see Config.h) before uiTick() switches over to MENU.
-    drawBitmapIcon(0, 0, bootLogo, SCREEN_WIDTH, SCREEN_HEIGHT);
+    // Full-screen boot splash. When a picture has been chosen in
+    // Settings > Splash and it is still on the card, that .bmp fills the
+    // whole panel (scaled to fit). Otherwise -- no card, no picture
+    // chosen, or the file is gone/damaged -- the built-in logo from
+    // Icons.h is shown instead, so boot always has a splash.
+    //
+    // Whichever is drawn stays up for BOOT_SPLASH_DURATION_MS (see
+    // Config.h) before uiTick() switches over to MENU.
+    bool drewSplash = false;
+    const char* splash = prefsSplashPath();
+
+    if (splash[0] != '\0' && sdReady)
+    {
+        drewSplash = bmpShowFullScreen(splash);
+    }
+
+    if (!drewSplash)
+    {
+        drawBitmapIcon(0, 0, bootLogo, SCREEN_WIDTH, SCREEN_HEIGHT);
+    }
+
+    lastActivityMs = millis();
+
+    // Power-on jingle, started exactly when the splash appears and
+    // stopped by uiTick() when the splash ends (or when it finishes on
+    // its own, whichever comes first).
+    audioBootTuneStart();
 }
 
 // =====================================================================
@@ -1188,14 +2054,14 @@ void drawCarousel(bool fullRedraw)
 
     float centerY = CONTENT_TOP + CONTENT_HEIGHT / 2.0f;
 
-    // Reserve room for the scrollbar + a gap so text never runs under it.
-    // Carousel text is drawn at size 2 (12px/char) now that it no
-    // longer has to share the screen with an icon/description panel.
+    // No scrollbar any more, so the names get the full panel width --
+    // only a small margin is kept at the right edge. Carousel text is
+    // drawn at size 2 (12px/char).
     int16_t textAreaX = RIGHT_PANEL_X + 4;
-    int16_t textAreaRight = SCREEN_WIDTH - SCROLLBAR_WIDTH - SCROLLBAR_GAP - 2;
+    int16_t textAreaRight = SCREEN_WIDTH - 4;
     uint8_t maxChars = (uint8_t)((textAreaRight - textAreaX) / 12);
     if (maxChars < 1) maxChars = 1;
-    if (maxChars > 15) maxChars = 15;
+    if (maxChars > 12) maxChars = 12;
 
     for (uint8_t i = 0; i < APP_COUNT; i++)
     {
@@ -1251,8 +2117,6 @@ void drawCarousel(bool fullRedraw)
         tft->print(label);
     }
 
-    drawScrollbar();
-
     // Redraw the status bar on top last. This guarantees any row that
     // slides close to the boundary is hidden behind it rather than
     // showing as a stray blob -- belt-and-braces alongside the clip
@@ -1260,43 +2124,19 @@ void drawCarousel(bool fullRedraw)
     drawStatusBar();
 }
 
-// Fixed highlight box behind the centered/selected row in the list --
-// a sharp-cornered rectangle, matching the rest of the retro theme.
+// Fixed outline behind the centered/selected row in the list. Outline
+// only -- the inside stays clear so the highlighted name sits on plain
+// background, like a selection box on an old terminal.
 void drawSelection()
 {
     float centerY = CONTENT_TOP + CONTENT_HEIGHT / 2.0f;
 
     int16_t boxX = RIGHT_PANEL_X;
-    int16_t boxW = RIGHT_PANEL_W - SCROLLBAR_WIDTH - SCROLLBAR_GAP;
+    int16_t boxW = RIGHT_PANEL_W;
     int16_t boxH = CAROUSEL_ITEM_H - 2;
     int16_t boxY = (int16_t)(centerY - boxH / 2.0f);
 
-    tft->fillRect(boxX, boxY, boxW, boxH, COLOR_SELECT_BG);
     tft->drawRect(boxX, boxY, boxW, boxH, COLOR_ACCENT_DIM);
-}
-
-// Vertical scrollbar along the rightmost edge showing progress through
-// the full app list -- a solid rectangle thumb, not a rounded pill.
-static void drawScrollbar()
-{
-    int16_t trackX = SCREEN_WIDTH - SCROLLBAR_WIDTH - 1;
-    int16_t trackY = CONTENT_TOP + 2;
-    int16_t trackH = CONTENT_HEIGHT - 4;
-
-    tft->drawFastVLine(trackX + SCROLLBAR_WIDTH / 2, trackY, trackH, COLOR_DIM);
-
-    int16_t thumbH = trackH / (int16_t)APP_COUNT;
-    if (thumbH < 6) thumbH = 6;
-    if (thumbH > trackH) thumbH = trackH;
-
-    float progress = (APP_COUNT > 1) ? (displayIndex / (float)(APP_COUNT - 1)) : 0.0f;
-    if (progress < 0.0f) progress = 0.0f;
-    if (progress > 1.0f) progress = 1.0f;
-
-
-    int16_t thumbY = trackY + (int16_t)(progress * (trackH - thumbH));
-
-    tft->fillRect(trackX, thumbY, SCROLLBAR_WIDTH, thumbH, COLOR_ACCENT);
 }
 
 // =====================================================================
@@ -1357,7 +2197,7 @@ void drawApp()
 
         tft->setTextSize(2);
         tft->setTextColor(COLOR_ACCENT);
-        const char* title = "GHOUL OS";
+        const char* title = "GHOUL OS X";
         int16_t tx = (SCREEN_WIDTH - (int16_t)strlen(title) * 12) / 2;
         if (tx < 2) tx = 2;
         tft->setCursor(tx, CONTENT_TOP + 12);
@@ -1380,13 +2220,6 @@ void drawApp()
         char upBuf[20];
         snprintf(upBuf, sizeof(upBuf), "Uptime: %02u:%02u", umins, usecs);
         tft->setCursor(10, y);  tft->print(upBuf);
-
-        tft->setTextColor(COLOR_DIM);
-        char hint[16];
-        snprintf(hint, sizeof(hint), "%c = Back", KEY_BACK);
-        int16_t hintX = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
-        tft->setCursor(hintX, SCREEN_HEIGHT - 10);
-        tft->print(hint);
         return;
     }
 
@@ -1411,14 +2244,6 @@ void drawApp()
     int16_t capX = (SCREEN_WIDTH - (int16_t)strlen(caption) * 6) / 2;
     tft->setCursor(capX, titleY + 26);
     tft->print(caption);
-
-    // Back hint at the bottom of the screen.
-    tft->setTextColor(COLOR_DIM);
-    char hint[16];
-    snprintf(hint, sizeof(hint), "%c = Back", KEY_BACK);
-    int16_t hintX = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
-    tft->setCursor(hintX, SCREEN_HEIGHT - 10);
-    tft->print(hint);
 }
 
 // =====================================================================
@@ -1502,14 +2327,6 @@ void drawKeyTest()
         }
     }
     keyTestLastKey = 0;
-
-    tft->setTextColor(COLOR_DIM);
-    char hint[28];
-    snprintf(hint, sizeof(hint), "%c = Back (not shown above)", KEY_BACK);
-    int16_t hintX = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
-    if (hintX < 2) hintX = 2;
-    tft->setCursor(hintX, SCREEN_HEIGHT - 10);
-    tft->print(hint);
 }
 
 // =====================================================================
@@ -1593,62 +2410,239 @@ void drawMiniPiano()
         }
     }
     musicLastNote = 255;
-
-    tft->setTextColor(COLOR_DIM);
-    char hint[30];
-    if (audioIsEnabled())
-    {
-        snprintf(hint, sizeof(hint), "Press 1-9    %c = Back", KEY_BACK);
-    }
-    else
-    {
-        snprintf(hint, sizeof(hint), "Muted (see Settings)  %c=Back", KEY_BACK);
-    }
-    int16_t hintX = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
-    if (hintX < 2) hintX = 2;
-    tft->setCursor(hintX, SCREEN_HEIGHT - 10);
-    tft->print(hint);
 }
 
 // =====================================================================
-// Settings app -- audio feedback on/off toggle
+// Settings app -- audio feedback on/off + colour theme
 // =====================================================================
 
-// Draws (or redraws) the audio toggle: a label, an on/off pill switch,
-// and an ON/OFF caption -- the only thing this screen shows, since
-// there's just the one setting.
-static void drawAudioToggleRow()
+// Draws (or redraws) one of the two setting rows: an outlined box with
+// the setting's name on the left and its current value on the right.
+// The highlighted row gets the brighter outline; the other stays dim.
+static void drawSettingsRow(uint8_t row)
 {
-    // Clear the whole toggle area before repainting it.
-    tft->fillRect(0, SETTINGS_TOGGLE_Y - 4, SCREEN_WIDTH, 56, COLOR_BG);
+    int16_t y = SETTINGS_ROW_Y + (int16_t)row * (SETTINGS_ROW_H + SETTINGS_ROW_GAP);
+    bool here = (settingsCursor == row);
 
-    const char* label = "AUDIO FEEDBACK";
+    tft->fillRect(SETTINGS_ROW_X, y, SETTINGS_ROW_W, SETTINGS_ROW_H, COLOR_BG);
+    tft->drawRect(SETTINGS_ROW_X, y, SETTINGS_ROW_W, SETTINGS_ROW_H,
+                  here ? COLOR_ACCENT : COLOR_ACCENT_DIM);
+
+    const char* label = "AUDIO";
+    if (row == 1)      label = "THEME";
+    else if (row == 2) label = "SPLASH";
+    else if (row == 3) label = "SLEEP";
+
     tft->setTextSize(1);
-    tft->setTextColor(COLOR_FG);
-    int16_t lx = (SCREEN_WIDTH - (int16_t)strlen(label) * 6) / 2;
-    if (lx < 2) lx = 2;
-    tft->setCursor(lx, SETTINGS_TOGGLE_Y);
+    tft->setTextColor(here ? COLOR_ACCENT : COLOR_FG);
+    tft->setCursor(SETTINGS_ROW_X + 5, y + (SETTINGS_ROW_H - 8) / 2);
     tft->print(label);
 
-    bool on = audioIsEnabled();
+    char value[20];
+    uint16_t valueColor;
 
-    // Bracketed "[ ON ]" / "[ OFF ]" toggle box -- sharp rectangle,
-    // matching the rest of the theme instead of a rounded pill switch.
-    char boxText[8];
-    snprintf(boxText, sizeof(boxText), "[ %s ]", on ? "ON" : "OFF");
+    if (row == 0)
+    {
+        snprintf(value, sizeof(value), "%s", audioIsEnabled() ? "ON" : "OFF");
+        valueColor = audioIsEnabled() ? COLOR_ACCENT : COLOR_DIM;
+    }
+    else if (row == 1)
+    {
+        snprintf(value, sizeof(value), "%s", themeName(themeGetIndex()));
+        valueColor = themeFgColor(themeGetIndex());
+    }
+    else if (row == 2)
+    {
+        // The chosen splash picture by filename, or DEFAULT for the
+        // built-in logo. Long names are shortened to fit the row.
+        const char* path = prefsSplashPath();
+        if (path[0] == '\0')
+        {
+            snprintf(value, sizeof(value), "DEFAULT");
+            valueColor = COLOR_DIM;
+        }
+        else
+        {
+            const char* slash = strrchr(path, '/');
+            const char* base = slash ? slash + 1 : path;
+            snprintf(value, sizeof(value), "%.14s", base);
+            valueColor = COLOR_ACCENT;
+        }
+    }
+    else
+    {
+        snprintf(value, sizeof(value), "%s", prefsSleepShortName(prefsSleepIndex()));
+        valueColor = (prefsSleepIndex() == 0) ? COLOR_DIM : COLOR_ACCENT;
+    }
 
-    tft->setTextSize(2);
-    int16_t boxW = (int16_t)strlen(boxText) * 12 + 12;
-    int16_t boxH = 26;
-    int16_t boxX = (SCREEN_WIDTH - boxW) / 2;
-    int16_t boxY = SETTINGS_TOGGLE_Y + 14;
+    int16_t vw = (int16_t)strlen(value) * 6;
+    tft->setTextColor(valueColor);
+    tft->setCursor(SETTINGS_ROW_X + SETTINGS_ROW_W - 5 - vw, y + (SETTINGS_ROW_H - 8) / 2);
+    tft->print(value);
+}
 
-    tft->fillRect(boxX, boxY, boxW, boxH, on ? COLOR_SELECT_BG : COLOR_BG);
-    tft->drawRect(boxX, boxY, boxW, boxH, on ? COLOR_ACCENT : COLOR_DIM);
+// The colour theme list: every available colour by name, with the
+// current one boxed. Each name is drawn in its own colour so the picker
+// doubles as a preview. Up/Down re-themes the whole device as you move.
+static void drawThemePicker()
+{
+    clearContent();
+    drawStatusBar();
 
-    tft->setTextColor(on ? COLOR_ACCENT : COLOR_DIM);
-    tft->setCursor(boxX + 6, boxY + 5);
-    tft->print(boxText);
+    tft->setTextSize(1);
+    tft->setTextColor(COLOR_ACCENT);
+    const char* title = "COLOUR THEME";
+    int16_t tx = (SCREEN_WIDTH - (int16_t)strlen(title) * 6) / 2;
+    if (tx < 2) tx = 2;
+    tft->setCursor(tx, CONTENT_TOP + 3);
+    tft->print(title);
+
+    for (uint8_t i = 0; i < themeCount(); i++)
+    {
+        int16_t y = SETTINGS_THEME_Y + (int16_t)i * SETTINGS_THEME_H;
+        bool sel = (i == themeGetIndex());
+
+        if (sel)
+        {
+            tft->drawRect(6, y - 2, SCREEN_WIDTH - 12, SETTINGS_THEME_H - 1, COLOR_ACCENT);
+        }
+
+        const char* name = themeName(i);
+        int16_t nx = (SCREEN_WIDTH - (int16_t)strlen(name) * 6) / 2;
+        tft->setTextColor(sel ? COLOR_ACCENT : themeFgColor(i));
+        tft->setCursor(nx, y);
+        tft->print(name);
+    }
+}
+
+// Scans the SD card's root folder for .bmp files, filling splashFiles[].
+// Only names are kept -- the chosen file is read straight from the card
+// each time the splash is drawn, so re-copying a picture with the same
+// name updates the boot screen without changing the setting.
+static void scanSplashFiles()
+{
+    splashFileCount = 0;
+
+    if (!sdReady) return;
+
+    File dir = SD.open("/");
+    if (!dir || !dir.isDirectory())
+    {
+        if (dir) dir.close();
+        return;
+    }
+
+    File entry = dir.openNextFile();
+    while (entry && splashFileCount < SPLASH_MAX_FILES)
+    {
+        if (!entry.isDirectory())
+        {
+            const char* rawName = entry.name();
+            const char* slash = strrchr(rawName, '/');
+            const char* base = slash ? slash + 1 : rawName;
+            size_t len = strlen(base);
+
+            if (len > 4 && strcasecmp(base + len - 4, ".bmp") == 0)
+            {
+                snprintf(splashFiles[splashFileCount], sizeof(splashFiles[0]), "/%s", base);
+                splashFileCount++;
+            }
+        }
+
+        entry.close();
+        entry = dir.openNextFile();
+    }
+
+    if (entry) entry.close();
+    dir.close();
+}
+
+// The splash-image list: the built-in logo first, then every .bmp found
+// in the card's root folder. The current choice is drawn brighter than
+// the rest so it is easy to see what is already selected.
+static void drawSplashPicker()
+{
+    clearContent();
+    drawStatusBar();
+
+    tft->setTextSize(1);
+    tft->setTextColor(COLOR_ACCENT);
+    const char* title = "SPLASH IMAGE";
+    int16_t tx = (SCREEN_WIDTH - (int16_t)strlen(title) * 6) / 2;
+    if (tx < 2) tx = 2;
+    tft->setCursor(tx, CONTENT_TOP + 2);
+    tft->print(title);
+
+    uint8_t total = (uint8_t)(splashFileCount + 1);
+
+    for (uint8_t slot = 0; slot < SETTINGS_LIST_VISIBLE; slot++)
+    {
+        uint8_t idx = (uint8_t)(splashScrollTop + slot);
+        if (idx >= total) break;
+
+        int16_t y = SETTINGS_LIST_Y + (int16_t)slot * SETTINGS_LIST_H;
+        bool sel = (idx == splashCursor);
+
+        if (sel)
+        {
+            tft->drawRect(6, y - 1, SCREEN_WIDTH - 12, SETTINGS_LIST_H - 1, COLOR_ACCENT);
+        }
+
+        char label[28];
+        bool isCurrent;
+
+        if (idx == 0)
+        {
+            snprintf(label, sizeof(label), "BUILT-IN LOGO");
+            isCurrent = (prefsSplashPath()[0] == '\0');
+        }
+        else
+        {
+            const char* path = splashFiles[idx - 1];
+            const char* slash = strrchr(path, '/');
+            snprintf(label, sizeof(label), "%.24s", slash ? slash + 1 : path);
+            isCurrent = (strcmp(path, prefsSplashPath()) == 0);
+        }
+
+        int16_t nx = (SCREEN_WIDTH - (int16_t)strlen(label) * 6) / 2;
+        if (nx < 2) nx = 2;
+        tft->setTextColor(sel ? COLOR_ACCENT : (isCurrent ? COLOR_FG : COLOR_DIM));
+        tft->setCursor(nx, y);
+        tft->print(label);
+    }
+}
+
+// The auto-sleep timeout list. One row per available timeout, from OFF
+// up to 10 minutes.
+static void drawSleepPicker()
+{
+    clearContent();
+    drawStatusBar();
+
+    tft->setTextSize(1);
+    tft->setTextColor(COLOR_ACCENT);
+    const char* title = "AUTO SLEEP";
+    int16_t tx = (SCREEN_WIDTH - (int16_t)strlen(title) * 6) / 2;
+    if (tx < 2) tx = 2;
+    tft->setCursor(tx, CONTENT_TOP + 2);
+    tft->print(title);
+
+    for (uint8_t i = 0; i < prefsSleepCount(); i++)
+    {
+        int16_t y = SETTINGS_LIST_Y + (int16_t)i * SETTINGS_LIST_H;
+        bool sel = (i == sleepCursor);
+
+        if (sel)
+        {
+            tft->drawRect(6, y - 1, SCREEN_WIDTH - 12, SETTINGS_LIST_H - 1, COLOR_ACCENT);
+        }
+
+        const char* name = prefsSleepName(i);
+        int16_t nx = (SCREEN_WIDTH - (int16_t)strlen(name) * 6) / 2;
+        tft->setTextColor(sel ? COLOR_ACCENT : COLOR_FG);
+        tft->setCursor(nx, y);
+        tft->print(name);
+    }
 }
 
 void drawSettings()
@@ -1661,18 +2655,13 @@ void drawSettings()
     const char* title = "Settings";
     int16_t titleX = (SCREEN_WIDTH - (int16_t)strlen(title) * 6) / 2;
     if (titleX < 2) titleX = 2;
-    tft->setCursor(titleX, CONTENT_TOP + 4);
+    tft->setCursor(titleX, CONTENT_TOP + 2);
     tft->print(title);
 
-    drawAudioToggleRow();
-
-    tft->setTextColor(COLOR_DIM);
-    char hint[24];
-    snprintf(hint, sizeof(hint), "%c=Toggle   %c=Back", KEY_SELECT, KEY_BACK);
-    int16_t hintX = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
-    if (hintX < 2) hintX = 2;
-    tft->setCursor(hintX, SCREEN_HEIGHT - 10);
-    tft->print(hint);
+    for (uint8_t i = 0; i < SETTINGS_ROW_COUNT; i++)
+    {
+        drawSettingsRow(i);
+    }
 }
 
 // =====================================================================
@@ -1783,14 +2772,6 @@ void drawBreakout()
         tft->setCursor(mx, BREAKOUT_PLAY_Y + BREAKOUT_PLAY_H / 2 - 4);
         tft->print(msg);
     }
-
-    // Hint
-    tft->setTextSize(1);
-    tft->setTextColor(COLOR_DIM);
-    const char* hint = "4=Left 6=Right 5=Launch";
-    hx = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
-    tft->setCursor(hx, SCREEN_HEIGHT - 10);
-    tft->print(hint);
 }
 
 // ---------------------------------------------------------------------
@@ -2176,12 +3157,6 @@ void drawWifiScanner()
 
     drawWifiScannerStatus();
     drawWifiScannerList();
-
-    tft->setTextColor(COLOR_DIM);
-    const char* hint = "5=Rescan *=Back";
-    int16_t hx = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
-    tft->setCursor(hx, SCREEN_HEIGHT - 10);
-    tft->print(hint);
 }
 
 // =====================================================================
@@ -2299,12 +3274,6 @@ void drawStockWatch()
 
     drawStockWatchStatus();
     drawStockWatchList();
-
-    tft->setTextColor(COLOR_DIM);
-    const char* hint = "5=Refresh *=Back";
-    int16_t hx = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
-    tft->setCursor(hx, SCREEN_HEIGHT - 10);
-    tft->print(hint);
 }
 
 // =====================================================================
@@ -2645,24 +3614,6 @@ void drawCalculator()
         tft->print(resLine);
     }
 
-    tft->setTextColor(COLOR_DIM);
-    const char* hint;
-    if (calcStage == CALC_STAGE_NUM1 || calcStage == CALC_STAGE_NUM2)
-    {
-        hint = "0-9=Digit #=Next *=Back";
-    }
-    else if (calcStage == CALC_STAGE_OP)
-    {
-        hint = "0=Up #=Down 5=Calc *=Back";
-    }
-    else
-    {
-        hint = "5=New calc *=Back";
-    }
-    int16_t hx = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
-    if (hx < 0) hx = 0;
-    tft->setCursor(hx, SCREEN_HEIGHT - 10);
-    tft->print(hint);
 }
 
 // =====================================================================
@@ -2690,6 +3641,33 @@ static void drawPacketMonStatus()
     tft->print(line2);
 }
 
+// Bar colour by packet rate: a fixed cool -> hot scale (teal, green,
+// yellow, orange, red) so a busy channel reads instantly. Deliberately
+// independent of the theme palette -- here the colour is information,
+// not decoration.
+static uint16_t packetMonRateColor(uint8_t count)
+{
+    static const uint16_t ramp[5] = { 0x0614, 0x4680, 0xFE80, 0xFA40, 0xF800 };
+
+    uint16_t ratio = (uint16_t)count * 100U / PACKETMON_GRAPH_MAX_PPS;
+    if (ratio > 100U) ratio = 100U;
+
+    uint8_t seg = (uint8_t)(ratio / 25U);        // 0..4 -> ramp[seg]..ramp[seg+1]
+    if (seg > 3) seg = 3;
+    uint16_t t = (uint16_t)(ratio - seg * 25U) * 4U; // 0..96 within the segment
+    uint16_t a = ramp[seg];
+    uint16_t b = ramp[seg + 1];
+
+    uint16_t ar = (a >> 11) & 0x1F, ag = (a >> 5) & 0x3F, ab = a & 0x1F;
+    uint16_t br = (b >> 11) & 0x1F, bg = (b >> 5) & 0x3F, bb = b & 0x1F;
+
+    uint16_t r = ((ar * (100 - t)) + (br * t) + 50) / 100;
+    uint16_t g = ((ag * (100 - t)) + (bg * t) + 50) / 100;
+    uint16_t bl = ((ab * (100 - t)) + (bb * t) + 50) / 100;
+
+    return (uint16_t)((r << 11) | (g << 5) | bl);
+}
+
 static void drawPacketMonGraph()
 {
     tft->fillRect(PACKETMON_GRAPH_X, PACKETMON_GRAPH_Y, PACKETMON_GRAPH_W, PACKETMON_GRAPH_H, COLOR_BG);
@@ -2707,7 +3685,7 @@ static void drawPacketMonGraph()
 
         int16_t x = PACKETMON_GRAPH_X + i;
         int16_t yTop = PACKETMON_GRAPH_Y + (PACKETMON_GRAPH_H - barH);
-        tft->drawFastVLine(x, yTop, barH, COLOR_ACCENT);
+        tft->drawFastVLine(x, yTop, barH, packetMonRateColor(count));
     }
 }
 
@@ -2726,12 +3704,6 @@ void drawPacketMon()
 
     drawPacketMonStatus();
     drawPacketMonGraph();
-
-    tft->setTextColor(COLOR_DIM);
-    const char* hint = "^v=Chan 5=Hop *=Back";
-    int16_t hx = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
-    tft->setCursor(hx, SCREEN_HEIGHT - 10);
-    tft->print(hint);
 }
 
 // =====================================================================
@@ -2783,8 +3755,8 @@ static void formatFileSize(uint32_t size, char* out, size_t outSize)
     }
 }
 
-// Breadcrumb path (top) + key hint (bottom) -- the parts of the Files
-// screen that don't change while browsing the same directory.
+// Breadcrumb path (top) -- the part of the Files screen that doesn't
+// change while browsing the same directory.
 static void drawFilesChrome()
 {
     tft->setTextSize(1);
@@ -2808,21 +3780,6 @@ static void drawFilesChrome()
     if (bx < 2) bx = 2;
     tft->setCursor(bx, CONTENT_TOP + 4);
     tft->print(breadcrumb);
-
-    tft->setTextColor(COLOR_DIM);
-    char hint[20];
-    if (sdReady)
-    {
-        snprintf(hint, sizeof(hint), "%c=Open  %c=Back", KEY_SELECT, KEY_BACK);
-    }
-    else
-    {
-        snprintf(hint, sizeof(hint), "%c = Back", KEY_BACK);
-    }
-    int16_t hx = (SCREEN_WIDTH - (int16_t)strlen(hint) * 6) / 2;
-    if (hx < 2) hx = 2;
-    tft->setCursor(hx, SCREEN_HEIGHT - 10);
-    tft->print(hint);
 
     if (!sdReady)
     {
@@ -2909,7 +3866,7 @@ static void drawFilesRow(uint8_t rowSlot, bool cursorHere)
 }
 
 // Repaints all currently visible rows -- used after moving the cursor
-// or scrolling, without touching the breadcrumb/hint chrome above/below.
+// or scrolling, without touching the breadcrumb above.
 static void refreshFilesRows()
 {
     for (uint8_t i = 0; i < FILES_VISIBLE_ROWS; i++)
@@ -3050,137 +4007,482 @@ static bool looksBinary(const char* buf, size_t len)
 
 // =====================================================================
 // BMP image viewer
+//
+// A self-contained bitmap reader -- no image library. The structure
+// follows the usual ESP32 image-viewer example (pre-allocate the line
+// buffers once, decode into an RGB565 frame and push whole rows to the
+// panel) rather than poking single pixels.
+//
+// The decoded frame costs 2 bytes per visible pixel (36 KB for a
+// full-screen picture) and the source row buffer is reused for every
+// row, so a multi-megapixel desktop wallpaper still shows up on the
+// little 160x128 panel.
+//
+// Supported: 1/4/8 bpp paletted, 16 bpp X1R5G5B5, 16/32 bpp bitfields,
+// 24 bpp BGR, 32 bpp BGRA, bottom-up (normal) and top-down (negative
+// height) files. Compressed (RLE) bitmaps are refused with a message
+// instead of being drawn as garbage.
 // =====================================================================
 
-static bool parseBmpHeader(const char* path)
+struct BmpHeader
 {
+    int32_t  width;
+    int32_t  height;
+    uint8_t  bpp;
+    bool     topDown;
+    bool     bitfields;
+    uint32_t dataOffset;
+    uint32_t stride;                    // bytes in one padded file row
+    uint32_t redMask, greenMask, blueMask;
+    uint16_t palette[256];
+};
+
+static BmpHeader   bmpInfo;
+static char        bmpPath[FB_MAX_PATH_LEN + FB_MAX_NAME_LEN + 2];
+static uint8_t     bmpViewingEntry;
+static bool        bmpFailed;
+static const char *bmpErrorLine1 = "";
+static const char *bmpErrorLine2 = "";
+static uint16_t    bmpColMap[SCREEN_WIDTH];
+
+static inline uint16_t bmpU16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+static inline uint32_t bmpU32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static inline uint16_t bmpRgb565(uint8_t r, uint8_t g, uint8_t b)
+{
+    return (uint16_t)(((uint16_t)(r & 0xF8) << 8) |
+                      ((uint16_t)(g & 0xFC) << 3) |
+                      (uint16_t)(b >> 3));
+}
+
+// Pulls one colour channel out of a pixel word using its bitfield mask
+// and scales it to a full 0..255 range, so 5-bit, 6-bit, 8-bit and even
+// 10-bit channels all end up looking right.
+static inline uint8_t bmpChannel(uint32_t pixel, uint32_t mask)
+{
+    if (mask == 0) return 0;
+
+    uint8_t shift = 0;
+    while (shift < 32 && ((mask >> shift) & 1u) == 0) shift++;
+
+    uint32_t field = mask >> shift;      // mask moved down to bit 0
+    uint8_t  count = 0;
+    while (count < 32 && ((field >> count) & 1u) != 0) count++;
+
+    if (count == 0) return 0;
+
+    uint32_t value = (pixel & mask) >> shift;
+
+    if (count >= 8) return (uint8_t)(value >> (count - 8));
+
+    // Fewer than 8 bits: widen to a full byte by repeating the pattern
+    // (5-bit 0b11111 becomes 0xFF, not 0x3F), which is what makes a 5-bit
+    // green channel look right on the 6-bit-green panel.
+    uint32_t out    = value;
+    uint8_t  filled = count;
+
+    while (filled < 8)
+    {
+        uint8_t missing = (uint8_t)(8 - filled);
+        uint8_t take    = (count < missing) ? count : missing;
+        out = (out << take) | (value >> (count - take));
+        filled = (uint8_t)(filled + take);
+    }
+    return (uint8_t)(out & 0xFFu);
+}
+
+// Converts real pixel x of an already-read padded source row to RGB565.
+static uint16_t bmpPixel(const uint8_t *row, int32_t x)
+{
+    switch (bmpInfo.bpp)
+    {
+    case 24:
+    {
+        const uint8_t *p = row + (uint32_t)x * 3u;
+        return bmpRgb565(p[2], p[1], p[0]);          // stored B, G, R
+    }
+    case 32:
+    {
+        const uint8_t *p = row + (uint32_t)x * 4u;
+        if (!bmpInfo.bitfields)
+        {
+            return bmpRgb565(p[2], p[1], p[0]);      // stored B, G, R, A
+        }
+        uint32_t v = bmpU32(p);
+        return bmpRgb565(bmpChannel(v, bmpInfo.redMask),
+                         bmpChannel(v, bmpInfo.greenMask),
+                         bmpChannel(v, bmpInfo.blueMask));
+    }
+    case 16:
+    {
+        uint32_t v = bmpU16(row + (uint32_t)x * 2u);
+        return bmpRgb565(bmpChannel(v, bmpInfo.redMask),
+                         bmpChannel(v, bmpInfo.greenMask),
+                         bmpChannel(v, bmpInfo.blueMask));
+    }
+    case 8:
+        return bmpInfo.palette[row[x]];
+    case 4:
+    {
+        uint8_t pair = row[x >> 1];
+        return bmpInfo.palette[(x & 1) ? (uint8_t)(pair & 0x0F) : (uint8_t)(pair >> 4)];
+    }
+    case 1:
+    {
+        uint8_t b = row[x >> 3];
+        return bmpInfo.palette[(b >> (7 - (x & 7))) & 0x01];
+    }
+    default:
+        break;
+    }
+    return 0;
+}
+
+static bool bmpFail(const char *line1, const char *line2)
+{
+    bmpErrorLine1 = line1;
+    bmpErrorLine2 = line2;
+    bmpFailed = true;
+    return false;
+}
+
+// Reads and validates the header, filling in bmpInfo. Returns false (and
+// leaves an explanation behind) when the file cannot be shown.
+static bool bmpParseHeader(const char *path)
+{
+    bmpFailed     = false;
+    bmpErrorLine1 = "";
+    bmpErrorLine2 = "";
+
     File f = SD.open(path, FILE_READ);
-    if (!f) return false;
+    if (!f) return bmpFail("Cannot open file", "");
 
     uint8_t hdr[54];
-    if (f.read(hdr, 54) != 54) { f.close(); return false; }
-    if (hdr[0] != 'B' || hdr[1] != 'M') { f.close(); return false; }
+    bool ok = false;
 
-    bmpDataOffset = *(uint32_t*)&hdr[10];
-    int32_t w     = *(int32_t*)&hdr[18];
-    int32_t h     = *(int32_t*)&hdr[22];
-    bmpBpp        = *(uint16_t*)&hdr[28];
-    uint32_t comp  = *(uint32_t*)&hdr[30];
+    do
+    {
+        uint32_t fileSize = (uint32_t)f.size();
+        if (fileSize < sizeof(hdr)) break;
+        if (f.read(hdr, sizeof(hdr)) != (int)sizeof(hdr)) break;
+        if (hdr[0] != 'B' || hdr[1] != 'M') break;
 
-    if (comp != 0)             { f.close(); return false; }
-    if (bmpBpp != 24 && bmpBpp != 16 && bmpBpp != 32)
-                               { f.close(); return false; }
-    if (w <= 0 || w > 4096 || h == 0 || h > 4096)
-                               { f.close(); return false; }
+        uint32_t dataOffset  = bmpU32(&hdr[10]);
+        uint32_t dibSize     = bmpU32(&hdr[14]);
+        int32_t  w           = (int32_t)bmpU32(&hdr[18]);
+        int32_t  h           = (int32_t)bmpU32(&hdr[22]);
+        uint16_t planes      = bmpU16(&hdr[26]);
+        uint16_t bpp         = bmpU16(&hdr[28]);
+        uint32_t compression = bmpU32(&hdr[30]);
+        uint32_t colorsUsed  = bmpU32(&hdr[46]);
 
-    bmpTopDown = (h < 0);
-    bmpHeight  = bmpTopDown ? -h : h;
-    bmpWidth   = w;
+        if (dibSize < 40) break;                    // old OS/2 core header
+        if (planes != 1) break;
+        if (bpp != 1 && bpp != 4 && bpp != 8 &&
+            bpp != 16 && bpp != 24 && bpp != 32) break;
+        if (w <= 0 || w > BMP_MAX_DIM) break;
+        if (h == 0 || h > BMP_MAX_DIM || h < -BMP_MAX_DIM) break;
 
-    uint32_t rowBytesRaw = ((uint32_t)bmpBpp / 8) * bmpWidth;
-    bmpRowStride = (rowBytesRaw + 3) & ~3u;
+        bool bitfields = false;
+        if (compression == 3 || compression == 6)   // BI_BITFIELDS / +alpha
+        {
+            if (bpp != 16 && bpp != 32) break;
+            bitfields = true;
+        }
+        else if (compression != 0)
+        {
+            break;                                  // RLE and anything exotic
+        }
+
+        int32_t  height = (h < 0) ? -h : h;
+        uint32_t stride = (((uint32_t)w * (uint32_t)bpp + 31u) / 32u) * 4u;
+        if (stride == 0 || stride > 65535u) break;
+
+        // Prove the pixel block really is inside the file before drawing,
+        // and never claim more rows than the file actually holds -- a
+        // truncated copy would otherwise read past the end and paint
+        // whatever junk comes back.
+        if (dataOffset < 14u + dibSize) break;
+        if (dataOffset > fileSize) break;
+
+        uint32_t rowsInFile = (fileSize - dataOffset) / stride;
+        if (rowsInFile == 0) break;                 // not even one full row
+        if ((uint32_t)height > rowsInFile) height = (int32_t)rowsInFile;
+
+        uint32_t rMask, gMask, bMask;
+        if (bitfields)
+        {
+            // Masks sit immediately after the 40-byte header, i.e. byte
+            // 54 of the file, for every BI_BITFIELDS bitmap.
+            uint8_t m[12];
+            if (!f.seek(54) || f.read(m, 12) != 12) break;
+            rMask = bmpU32(&m[0]);
+            gMask = bmpU32(&m[4]);
+            bMask = bmpU32(&m[8]);
+            if (rMask == 0 || gMask == 0 || bMask == 0) break;
+        }
+        else if (bpp == 16)
+        {
+            rMask = 0x7C00u; gMask = 0x03E0u; bMask = 0x001Fu;  // X1R5G5B5
+        }
+        else
+        {
+            rMask = 0xFF0000u; gMask = 0x00FF00u; bMask = 0x0000FFu;
+        }
+
+        memset(bmpInfo.palette, 0, sizeof(bmpInfo.palette));
+        if (bpp <= 8)
+        {
+            uint32_t entries = colorsUsed;
+            if (entries == 0 || entries > 256u) entries = 1ul << bpp;
+
+            if (!f.seek(14u + dibSize)) break;
+
+            // Entries the file does not actually carry stay black (the
+            // table was zeroed above), so a wrong count cannot read past
+            // the array.
+            uint8_t ent[4];
+            for (uint32_t i = 0; i < entries; i++)
+            {
+                if (f.read(ent, 4) != 4) break;
+                bmpInfo.palette[i] = bmpRgb565(ent[2], ent[1], ent[0]);
+            }
+        }
+
+        bmpInfo.width      = w;
+        bmpInfo.height     = height;
+        bmpInfo.bpp        = (uint8_t)bpp;
+        bmpInfo.topDown    = (h < 0);
+        bmpInfo.bitfields  = bitfields;
+        bmpInfo.dataOffset = dataOffset;
+        bmpInfo.stride     = stride;
+        bmpInfo.redMask    = rMask;
+        bmpInfo.greenMask  = gMask;
+        bmpInfo.blueMask   = bMask;
+        ok = true;
+    } while (0);
 
     f.close();
+
+    if (!ok) return bmpFail("Cannot show BMP", "unsupported or damaged");
     return true;
 }
 
-static void drawBmpView();
-static void openBmpView(uint8_t realIdx)
+static void bmpDrawMessage()
 {
-    if (realIdx >= fileEntryCount) return;
+    clearContent();
+    drawStatusBar();
 
-    const char* name = fileEntries[realIdx].name;
-    if (currentPath[1] == '\0')
-        snprintf(bmpFilePath, sizeof(bmpFilePath), "/%s", name);
-    else
-        snprintf(bmpFilePath, sizeof(bmpFilePath), "%s/%s", currentPath, name);
+    tft->setTextSize(1);
 
-    if (!parseBmpHeader(bmpFilePath))
+    const char *lines[2] = { bmpErrorLine1, bmpErrorLine2 };
+    int16_t y = CONTENT_TOP + 42;
+
+    for (uint8_t i = 0; i < 2; i++)
     {
-        return;
-    }
+        if (lines[i] == nullptr || lines[i][0] == '\0') continue;
 
-    bmpViewingEntry = realIdx;
-    currentState = BMPVIEW;
-    drawBmpView();
+        int16_t x = (int16_t)((SCREEN_WIDTH - (int16_t)strlen(lines[i]) * 6) / 2);
+        if (x < 2) x = 2;
+
+        tft->setTextColor(i == 0 ? COLOR_FG : COLOR_DIM);
+        tft->setCursor(x, (int16_t)(y + (int16_t)i * 12));
+        tft->print(lines[i]);
+    }
 }
 
+// Decodes the parsed bitmap and draws it: shrunk to fit when bigger than
+// the content area, otherwise centred at 1:1.
+//
+// The picture is decoded into one RGB565 frame buffer first and only then
+// sent to the panel, in a single address window with one transfer per row.
+// Keeping the SD reads and the panel writes in separate phases means the
+// shared SPI bus is never flipped back and forth mid-picture, and the
+// pixels leave through the same byte path the rest of the UI uses
+// (writeBytes, via writePixels(..., bigEndian = true)), which is the path
+// already known to work on this panel. The frame is stored already
+// byte-swapped, since that path sends the bytes exactly as they sit in RAM.
+// Decodes the parsed bitmap and blits it into the given screen
+// rectangle: shrunk to fit when bigger, otherwise centred at 1:1. The
+// caller is responsible for clearing/backfilling the surroundings.
+// Returns false when the picture could not be prepared or read at all.
+static bool bmpBlit(int16_t areaX, int16_t areaY, int16_t areaW, int16_t areaH)
+{
+    if (bmpFailed) return false;
+
+    int16_t outW = (int16_t)bmpInfo.width;
+    int16_t outH = (int16_t)bmpInfo.height;
+
+    if (outW > areaW || outH > areaH)
+    {
+        // 8.8 fixed-point scale factor; never less than 1:1 (256).
+        uint32_t sx = ((uint32_t)bmpInfo.width  << 8) / (uint32_t)areaW;
+        uint32_t sy = ((uint32_t)bmpInfo.height << 8) / (uint32_t)areaH;
+        uint32_t scale = (sx > sy) ? sx : sy;
+        if (scale < 256u) scale = 256u;
+
+        outW = (int16_t)(((uint32_t)bmpInfo.width  << 8) / scale);
+        outH = (int16_t)(((uint32_t)bmpInfo.height << 8) / scale);
+        if (outW < 1) outW = 1;
+        if (outH < 1) outH = 1;
+        if (outW > areaW) outW = areaW;
+        if (outH > areaH) outH = areaH;
+    }
+
+    int16_t outX = (int16_t)(areaX + (areaW - outW) / 2);
+    int16_t outY = (int16_t)(areaY + (areaH - outH) / 2);
+
+    // Column lookup: which source column each screen column shows.
+    for (int16_t ox = 0; ox < outW; ox++)
+    {
+        int32_t srcX = (int32_t)((uint32_t)ox * (uint32_t)bmpInfo.width / (uint32_t)outW);
+        if (srcX >= bmpInfo.width) srcX = bmpInfo.width - 1;
+        bmpColMap[ox] = (uint16_t)srcX;
+    }
+
+    File f = SD.open(bmpPath, FILE_READ);
+    if (!f)
+    {
+        bmpFail("Cannot open file", "");
+        return false;
+    }
+
+    uint8_t  *row   = (uint8_t *)malloc(bmpInfo.stride);
+    uint16_t *frame = (uint16_t *)malloc((size_t)outW * (size_t)outH * sizeof(uint16_t));
+
+    if (row == nullptr || frame == nullptr)
+    {
+        free(row);
+        free(frame);
+        f.close();
+        bmpFail("Out of memory", "image too large");
+        return false;
+    }
+
+    bool anyRow = false;
+
+    for (int16_t oy = 0; oy < outH; oy++)
+    {
+        uint16_t *dst = frame + (uint32_t)oy * (uint32_t)outW;
+
+        // Nearest-neighbour pick of the source row for this screen row.
+        int32_t srcY = (int32_t)((int32_t)oy * bmpInfo.height / outH);
+        if (srcY >= bmpInfo.height) srcY = bmpInfo.height - 1;
+
+        // Bottom-up files (the normal case) store the last row first.
+        int32_t fileRow = bmpInfo.topDown ? srcY : (bmpInfo.height - 1 - srcY);
+
+        uint32_t pos = bmpInfo.dataOffset + (uint32_t)fileRow * bmpInfo.stride;
+        bool haveRow = false;
+
+        if (f.seek(pos))
+        {
+            size_t got = f.read(row, bmpInfo.stride);
+            if (got > 0)
+            {
+                // Short row at the end of a clipped file: pad with black
+                // instead of leaving stale bytes from the previous row.
+                if (got < bmpInfo.stride) memset(row + got, 0, bmpInfo.stride - got);
+                haveRow = true;
+                anyRow  = true;
+            }
+        }
+
+        if (!haveRow)
+        {
+            // A row that cannot be read shows as black rather than as a
+            // half-drawn mess.
+            memset(dst, 0, (size_t)outW * sizeof(uint16_t));
+            continue;
+        }
+
+        for (int16_t ox = 0; ox < outW; ox++)
+        {
+            dst[ox] = __builtin_bswap16(bmpPixel(row, (int32_t)bmpColMap[ox]));
+        }
+    }
+
+    free(row);
+    f.close();
+
+    if (!anyRow)
+    {
+        free(frame);
+        bmpFail("Cannot read image", "file looks incomplete");
+        return false;
+    }
+
+    // One window for the whole picture, then the rows in order. Nothing
+    // else touches the SPI bus until the last row is out.
+    tft->startWrite();
+    tft->setAddrWindow((uint16_t)outX, (uint16_t)outY, (uint16_t)outW, (uint16_t)outH);
+
+    for (int16_t oy = 0; oy < outH; oy++)
+    {
+        tft->writePixels(frame + (uint32_t)oy * (uint32_t)outW, (uint32_t)outW, true, true);
+    }
+
+    tft->endWrite();
+
+    free(frame);
+    return true;
+}
+
+// BMP viewer screen: the picture fills the content area under the status
+// bar, or an explanation is shown when it cannot be drawn.
 static void drawBmpView()
 {
     clearContent();
     drawStatusBar();
-    tft->setTextSize(1);
-    tft->setTextColor(COLOR_FG);
-    tft->setCursor(52, CONTENT_TOP + 50);
-    tft->print("Loading...");
 
-    File f = SD.open(bmpFilePath, FILE_READ);
-    if (!f)
+    if (!bmpBlit(0, CONTENT_TOP, SCREEN_WIDTH, SCREEN_HEIGHT - CONTENT_TOP))
     {
-        clearContent();
-        drawStatusBar();
-        tft->setCursor(40, CONTENT_TOP + 50);
-        tft->setTextColor(COLOR_DIM);
-        tft->print("(cannot open)");
-        return;
+        bmpDrawMessage();
     }
+}
 
-    uint8_t bpp = bmpBpp / 8;
+// Draws the given .bmp across the entire panel. Used by the boot splash,
+// which has no status bar. Returns false when the file cannot be shown
+// (the caller then falls back to the built-in logo).
+static bool bmpShowFullScreen(const char* path)
+{
+    size_t len = strlen(path);
+    if (len == 0 || len >= sizeof(bmpPath)) return false;
 
-    // Allocate batch buffer: BMP_BATCH rows of RGB565 pixels.
-    if (!bmpBatchBuf)
-        bmpBatchBuf = (uint16_t *)malloc(BMP_BATCH * (uint32_t)bmpWidth * sizeof(uint16_t));
+    memcpy(bmpPath, path, len + 1);
 
-    f.seek(bmpDataOffset);
+    if (!bmpParseHeader(bmpPath)) return false;
 
-    for (int32_t startRow = 0; startRow < bmpHeight; startRow += BMP_BATCH)
-    {
-        int32_t count = (bmpHeight - startRow < BMP_BATCH) ? (bmpHeight - startRow) : BMP_BATCH;
+    tft->fillScreen(COLOR_BG);
+    return bmpBlit(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+}
 
-        // --- Phase 1: Read BMP_BATCH rows from SD, convert to RGB565 ---
-        for (int32_t r = 0; r < count; r++)
-        {
-            f.read(bmpRowBuf, bmpRowStride);
+// Opens fileEntries[realIdx] in the viewer. A file that cannot be shown
+// still switches into BMPVIEW, so it shows a clear message and KEY_BACK
+// takes the user back to the file list.
+static void openBmpView(uint8_t realIdx)
+{
+    if (realIdx >= fileEntryCount) return;
 
-            uint16_t *dst = bmpBatchBuf ? (bmpBatchBuf + r * bmpWidth) : bmpSrcLine;
-            for (uint16_t i = 0; i < bmpWidth; i++)
-            {
-                uint16_t off = i * bpp;
-                if (bmpBpp == 24)
-                {
-                    dst[i] = ((uint16_t)(bmpRowBuf[off + 2] >> 3) << 11) |
-                             ((uint16_t)(bmpRowBuf[off + 1] >> 2) << 5)  |
-                             (bmpRowBuf[off] >> 3);
-                }
-                else if (bmpBpp == 16)
-                {
-                    uint16_t raw = bmpRowBuf[off] | ((uint16_t)bmpRowBuf[off + 1] << 8);
-                    dst[i] = (((raw >> 10) & 0x1F) << 11) |
-                             (((raw >> 5) & 0x1F) << 6)  |
-                             (raw & 0x1F);
-                }
-                else
-                {
-                    dst[i] = ((uint16_t)(bmpRowBuf[off + 2] >> 3) << 11) |
-                             ((uint16_t)(bmpRowBuf[off + 1] >> 2) << 5)  |
-                             (bmpRowBuf[off] >> 3);
-                }
-            }
-        }
+    const char *name = fileEntries[realIdx].name;
+    if (currentPath[1] == '\0')
+        snprintf(bmpPath, sizeof(bmpPath), "/%s", name);
+    else
+        snprintf(bmpPath, sizeof(bmpPath), "%s/%s", currentPath, name);
 
-        // --- Phase 2: Write batch to TFT (no SD reads in between) ---
-        for (int32_t r = 0; r < count; r++)
-        {
-            uint16_t *row = bmpBatchBuf ? (bmpBatchBuf + r * bmpWidth) : bmpSrcLine;
-            tft->startWrite();
-            tft->setAddrWindow(0, startRow + r, bmpWidth, 1);
-            tft->writePixels(row, bmpWidth);
-            tft->endWrite();
-        }
-    }
+    bmpViewingEntry = realIdx;
+    bmpParseHeader(bmpPath);
 
-    if (bmpBatchBuf) { free(bmpBatchBuf); bmpBatchBuf = nullptr; }
-    f.close();
+    currentState = BMPVIEW;
+    drawBmpView();
 }
 
 // Reads fileEntries[realIdx] from SD and switches into the FILEVIEW state.
@@ -3235,19 +4537,12 @@ static void openFilePreview(uint8_t realIdx)
 
 void drawFileView()
 {
-    clearContent();
-    drawStatusBar();
+    // Text preview owns the whole panel: no status bar, no filename line,
+    // so as much of the file as possible is on screen. Back returns to
+    // the Files list, which repaints its own chrome.
+    tft->fillScreen(COLOR_BG);
 
     tft->setTextSize(1);
-    tft->setTextColor(COLOR_FG);
-    char title[22];
-    strncpy(title, fileEntries[filesViewingEntry].name, sizeof(title) - 1);
-    title[sizeof(title) - 1] = '\0';
-    int16_t tx = (SCREEN_WIDTH - (int16_t)strlen(title) * 6) / 2;
-    if (tx < 2) tx = 2;
-    tft->setCursor(tx, CONTENT_TOP + 2);
-    tft->print(title);
-
     tft->setTextColor(COLOR_FG);
     if (fileViewLineCount == 0)
     {
@@ -3272,17 +4567,18 @@ void drawFileView()
 
         int16_t ex = (SCREEN_WIDTH - (int16_t)strlen(empty) * 6) / 2;
         if (ex < 2) ex = 2;
-        tft->setCursor(ex, CONTENT_TOP + 30);
+        tft->setCursor(ex, SCREEN_HEIGHT / 2 - 4);
         tft->print(empty);
     }
     else
     {
-        int16_t textY = CONTENT_TOP + 14;
+        // 26 characters per line at 6px each, 2px left margin -- the
+        // whole 160px width is used, starting at the very top row.
         for (uint8_t i = 0; i < FILEVIEW_VISIBLE_LINES; i++)
         {
             uint8_t lineIdx = filePreviewLineOffset + i;
             if (lineIdx >= fileViewLineCount) break;
-            tft->setCursor(6, textY + i * FILEVIEW_LINE_H);
+            tft->setCursor(2, 2 + i * FILEVIEW_LINE_H);
             tft->print(fileViewLines[lineIdx]);
         }
 
@@ -3347,4 +4643,44 @@ void drawIcon(int16_t x, int16_t y, const uint16_t* icon, uint8_t w, uint8_t h)
     tft->drawLine(x, y, x + w - 1, y + h - 1, COLOR_DIM);
     tft->drawLine(x + w - 1, y, x, y + h - 1, COLOR_DIM);
 #endif
+}
+
+// =====================================================================
+// Auto sleep -- waking the panel back up
+// =====================================================================
+
+// Repaints whichever screen is currently open. The display is fully
+// switched off while asleep, so after waking it has to be drawn again
+// from scratch -- the right screen for whatever app was open when the
+// timeout fired, not a jump back to the menu.
+static void redrawCurrentScreen()
+{
+    switch (currentState)
+    {
+    case BOOT:      drawBoot();        break;
+    case MENU:      drawMenu(true);    break;
+    case APP:       drawApp();         break;
+    case KEYTEST:   drawKeyTest();     break;
+    case SETTINGS:
+        if (settingsSub == SETTINGS_SUB_THEME)       drawThemePicker();
+        else if (settingsSub == SETTINGS_SUB_SPLASH) drawSplashPicker();
+        else if (settingsSub == SETTINGS_SUB_SLEEP)  drawSleepPicker();
+        else                                         drawSettings();
+        break;
+    case FILES:     drawFiles();       break;
+    case FILEVIEW:  drawFileView();    break;
+    case MINIPIANO: drawMiniPiano();   break;
+    case BREAKOUT:  drawBreakout();    break;
+    case BMPVIEW:   drawBmpView();     break;
+    case PACKETMON: drawPacketMon();   break;
+    case WIFISCAN:  drawWifiScanner(); break;
+    case STOCKWATCH: drawStockWatch(); break;
+    case CALCULATOR: drawCalculator(); break;
+    case MATRIX:    drawMatrix();      break;
+    case GAME2048:  drawGame2048();    break;
+    case BLEKEY:    drawBleKeyboard(); break;
+    case BLEKB:     drawBleKeyboardView(); break;
+    case BLEREMOTE: drawBleRemote();   break;
+    default:        drawMenu(true);    break;
+    }
 }
