@@ -12,10 +12,11 @@
 // channels/resolution itself, keeping it simple and portable across
 // ESP32 core versions.
 //
-// Two things use it:
+// Three things use it:
 //   - A short "click" on every navigation key press (Up/Down/Select/Back),
 //     the way many small handheld devices give audio feedback.
 //   - The Music app's 9-key mini piano (keys 1-9).
+//   - The little power-on jingle played while the boot splash is up.
 //
 // Whether audio feedback is enabled is stored in NVS flash (via the
 // Preferences library) under namespace "ghoulos", key "audioOn", so the
@@ -36,6 +37,15 @@ void audioPlayNote(uint8_t noteIndex);
 
 // Immediately silences the buzzer.
 void audioStop();
+
+// Boot jingle. audioBootTuneStart() begins the placeholder power-on
+// melody (see bootTune[] in Audio.cpp to change it); call
+// audioBootTuneService() often while it should be playing -- it is fully
+// non-blocking, so the splash screen keeps animating; audioBootTuneStop()
+// silences it when the splash ends.
+void audioBootTuneStart();
+void audioBootTuneService();
+void audioBootTuneStop();
 
 // Returns the note name for noteIndex (0-8), e.g. "C4", "G4", "D5".
 // Returns an empty string if noteIndex is out of range.
