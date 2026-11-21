@@ -28,7 +28,10 @@ enum UIState {
     STOCKWATCH, // "StockWatch" app: live stock prices via Finnhub
     CALCULATOR, // "Calculator" app: digit-entry calculator with a menu of operations
     MATRIX,     // "Matrix" app: full-screen digital-rain screensaver
-    GAME2048    // "2048" app: slide-and-merge number tile game
+    GAME2048,   // "2048" app: slide-and-merge number tile game
+    BLEKEY,     // "BLE Keybd" app: connection screen + Keyboard/Remote submenu
+    BLEKB,      // "BLE Keybd" app: scrollable list of individual keystrokes to send
+    BLEREMOTE   // "BLE Keybd" app: D-pad remote that sends arrows/media keys
 };
 
 extern UIState currentState;
@@ -62,6 +65,9 @@ void drawStockWatch();
 void drawCalculator();
 void drawMatrix();
 void drawGame2048();
+void drawBleKeyboard();
+void drawBleKeyboardView();
+void drawBleRemote();
 void clearContent();
 
 #endif // UI_H
