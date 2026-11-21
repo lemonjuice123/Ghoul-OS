@@ -34,6 +34,7 @@ void launchKeyTest();
 void launchCalculator();
 void launchMatrix();
 void launch2048();
+void launchBleKeyboard();
 
 // App table and count – defined in Apps.cpp.
 extern const App appList[];
